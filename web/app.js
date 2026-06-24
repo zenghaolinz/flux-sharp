@@ -5,6 +5,14 @@
 import * as THREE from "three";
 import { OrbitControls } from "/web/vendor/OrbitControls.js";
 import { PLYLoader } from "/web/vendor/PLYLoader.js";
+import { Viewer } from "@mkkellogg/gaussian-splats-3d";
+
+// Debug switch: when true, 3DGS PLYs render as a plain colored point cloud
+// (PointsMaterial) to verify the parser, f_dc->RGB color, coordinate flip, and
+// camera framing are correct — independent of the splat shader. If this mode
+// shows a colored subject, the bug is in createSplatMaterial; if it's still
+// grey/white dots, the bug is in the parser/framing.
+const DEBUG_POINT_PREVIEW = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -79,11 +87,42 @@ function onResize() {
   state.camera.aspect = wrap.clientWidth / wrap.clientHeight;
   state.camera.updateProjectionMatrix();
   state.renderer.setSize(wrap.clientWidth, wrap.clientHeight, false);
+  updateViewportUniform();
   requestRender();
+}
+
+// Keep the splat shader's viewport uniform in sync with the canvas size; it's
+// needed to convert projected covariance into pixel-space gl_PointSize.
+function updateViewportUniform() {
+  const material = state.currentMesh?.material;
+  if (material?.uniforms?.viewport) {
+    const canvas = state.renderer.domElement;
+    material.uniforms.viewport.value.set(canvas.width, canvas.height);
+  }
 }
 
 // Render only when needed (orbit interaction or damping tail) to keep a >1M
 // splat scene responsive instead of redrawing every frame.
+let continuousRenderId = null;
+function startContinuousRender() {
+  if (continuousRenderId) return;
+  const loop = () => {
+    continuousRenderId = requestAnimationFrame(loop);
+    state.controls.update();
+    if (state.currentMesh?.update) {
+      state.currentMesh.update();
+    }
+    state.renderer.render(state.scene, state.camera);
+  };
+  continuousRenderId = requestAnimationFrame(loop);
+}
+function stopContinuousRender() {
+  if (continuousRenderId) {
+    cancelAnimationFrame(continuousRenderId);
+    continuousRenderId = null;
+  }
+}
+
 let renderQueued = false;
 function requestRender() {
   if (renderQueued) return;
@@ -91,6 +130,10 @@ function requestRender() {
   requestAnimationFrame(() => {
     renderQueued = false;
     state.controls.update();
+    // GaussianSplats3D needs a per-frame update() for splat sorting.
+    if (state.currentMesh?.update) {
+      state.currentMesh.update();
+    }
     state.renderer.render(state.scene, state.camera);
     // Keep the damping tail animating until controls settle.
     startAnimation();
@@ -111,10 +154,18 @@ function startAnimation() {
 }
 
 function disposeCurrentMesh() {
-  if (state.currentMesh) {
-    state.scene.remove(state.currentMesh);
-    state.currentMesh.geometry?.dispose();
-    state.currentMesh.material?.dispose();
+  stopContinuousRender();
+  const m = state.currentMesh;
+  if (m) {
+    // GaussianSplats3D Viewer: dispose its resources; for regular meshes,
+    // remove from scene and dispose geometry/material.
+    if (m.dispose) {
+      m.dispose();
+    } else {
+      state.scene.remove(m);
+      m.geometry?.dispose();
+      m.material?.dispose();
+    }
     state.currentMesh = null;
   }
 }
@@ -199,14 +250,15 @@ function buildGeometryFromPly(buffer) {
   // discrete GPU 500k renders smoothly. Stride-sampling keeps a representative
   // subset so the subject stays dense.
   // Cap splats so the cloud renders without crashing the WebGL context on the
-  // integrated GPU. On a discrete GPU this can be raised; the iGPU tops out
-  // around ~250k splats before context loss.
-  const MAX_SPLATS = 250000;
+  // integrated GPU. With the discrete GPU (powerPreference + Windows GPU
+  // preference), all splats render; lower this only if the iGPU is still in use.
+  const MAX_SPLATS = Infinity;
   const strideSample = visibleCount > MAX_SPLATS ? Math.ceil(visibleCount / MAX_SPLATS) : 1;
   const renderCount = Math.ceil(visibleCount / strideSample);
 
   const positions = new Float32Array(renderCount * 3);
   const colors = new Float32Array(renderCount * 3);
+  const alphaAttr = new Float32Array(renderCount);
   // Per-splat 3D covariance (xx,yy,zz,xy in covA; xz,yz in covB) for true
   // gaussian-splat rendering: each splat becomes an elliptical billboard sized
   // by its scale+rotation, not a uniform round point.
@@ -237,21 +289,24 @@ function buildGeometryFromPly(buffer) {
     const g = 0.5 + SH_C0 * view.getFloat32(base + propIndex["f_dc_1"] * 4, littleEndian);
     const b = 0.5 + SH_C0 * view.getFloat32(base + propIndex["f_dc_2"] * 4, littleEndian);
     const alpha = alphas[i];
-    // Keep full color; opacity is applied via the splat's screen coverage and
-    // the fragment alpha test, not by darkening the color.
+    alphaAttr[out] = alpha;
+    // Keep full color; opacity is applied in the fragment shader via vAlpha.
     colors[out * 3] = clamp01(r);
     colors[out * 3 + 1] = clamp01(g);
     colors[out * 3 + 2] = clamp01(b);
 
     // 3D covariance = R * diag(s0^2,s1^2,s2^2) * R^T from scale (exp) and
-    // rotation quaternion (w,x,y,z). Store 6 unique symmetric entries.
+    // rotation quaternion (w,x,y,z). Normalize the quaternion first — SHARP
+    // doesn't guarantee unit quaternions.
     const s0 = Math.exp(view.getFloat32(base + propIndex["scale_0"] * 4, littleEndian));
     const s1 = Math.exp(view.getFloat32(base + propIndex["scale_1"] * 4, littleEndian));
     const s2 = Math.exp(view.getFloat32(base + propIndex["scale_2"] * 4, littleEndian));
-    const qw = view.getFloat32(base + propIndex["rot_0"] * 4, littleEndian);
-    const qx = view.getFloat32(base + propIndex["rot_1"] * 4, littleEndian);
-    const qy = view.getFloat32(base + propIndex["rot_2"] * 4, littleEndian);
-    const qz = view.getFloat32(base + propIndex["rot_3"] * 4, littleEndian);
+    let qw = view.getFloat32(base + propIndex["rot_0"] * 4, littleEndian);
+    let qx = view.getFloat32(base + propIndex["rot_1"] * 4, littleEndian);
+    let qy = view.getFloat32(base + propIndex["rot_2"] * 4, littleEndian);
+    let qz = view.getFloat32(base + propIndex["rot_3"] * 4, littleEndian);
+    const qn = Math.hypot(qw, qx, qy, qz) || 1.0;
+    qw /= qn; qx /= qn; qy /= qn; qz /= qn;
     const r00 = 1 - 2 * (qy * qy + qz * qz);
     const r01 = 2 * (qx * qy - qz * qw);
     const r02 = 2 * (qx * qz + qy * qw);
@@ -271,6 +326,7 @@ function buildGeometryFromPly(buffer) {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute("alpha", new THREE.BufferAttribute(alphaAttr, 1));
   geometry.setAttribute("cov3dA", new THREE.BufferAttribute(covA, 4));
   geometry.setAttribute("cov3dB", new THREE.BufferAttribute(covB, 2));
   geometry.userData.is3dgs = true;
@@ -282,66 +338,115 @@ function clamp01(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 
+// Frame a loaded GaussianSplats3D scene: center it at the origin and set the
+// camera distance so the bounding box fills the view.
+function frameSplatBox(box) {
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  // Re-center the splat group at the origin for orbiting.
+  if (state.currentMesh) {
+    state.currentMesh.position.sub(center);
+  }
+  const fov = state.camera.fov * Math.PI / 180;
+  const aspect = state.camera.aspect || 1;
+  const distForH = size.y / (2 * Math.tan(fov / 2));
+  const distForW = size.x / (2 * Math.tan(fov / 2) * aspect);
+  const fitDist = Math.max(distForH, distForW) * 1.2;
+  state.camera.position.set(0, 0, fitDist);
+  state.camera.near = Math.max(fitDist * 0.001, 0.1);
+  state.camera.far = Math.max(fitDist, size.z) * 50 + 1000;
+  state.camera.updateProjectionMatrix();
+  state.controls.target.set(0, 0, 0);
+  state.controls.update();
+  showViewerOverlay(
+    `3DGS · ${Math.round(size.x * 100) / 100} × ${Math.round(size.y * 100) / 100} × ${Math.round(size.z * 100) / 100}`
+  );
+}
+
 // True gaussian-splat material: each splat is a screen-space elliptical
 // billboard whose size/shape comes from the projected 3D covariance (scale +
 // rotation), with a gaussian alpha falloff so overlapping splats blend into a
 // continuous smooth surface. This is real 3DGS rendering, not a point cloud.
 function createSplatMaterial() {
   return new THREE.ShaderMaterial({
-    transparent: false,
-    depthWrite: true,
-    depthTest: true,
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
     blending: THREE.NormalBlending,
+    uniforms: {
+      viewport: { value: new THREE.Vector2(1, 1) },
+    },
     vertexShader: /* glsl */ `
       attribute vec3 color;
+      attribute float alpha;
       attribute vec4 cov3dA;   // xx, yy, zz, xy
       attribute vec2 cov3dB;   // xz, yz
+      uniform vec2 viewport;
       varying vec3 vColor;
+      varying float vAlpha;
       varying vec2 vCov2D;     // (a, c) diagonal
       varying float vCov2D_b;  // off-diagonal
+      varying float vRadius;
       void main() {
         vColor = color;
+        vAlpha = alpha;
         vec4 mv = modelViewMatrix * vec4(position, 1.0);
         gl_Position = projectionMatrix * mv;
 
+        float z = -mv.z;
+        if (z <= 0.0001) {
+          gl_PointSize = 0.0;
+          return;
+        }
+
         float sxx = cov3dA.x, syy = cov3dA.y, szz = cov3dA.z;
         float sxy = cov3dA.w, sxz = cov3dB.x, syz = cov3dB.y;
-        // Clamp so giant outlier gaussians don't explode.
-        sxx = clamp(sxx, 0.0, 4.0); syy = clamp(syy, 0.0, 4.0); szz = clamp(szz, 0.0, 4.0);
+        sxx = clamp(sxx, 0.0, 4.0);
+        syy = clamp(syy, 0.0, 4.0);
+        szz = clamp(szz, 0.0, 4.0);
 
-        float z = mv.z;
-        if (z == 0.0) z = -0.0001;
-        float fx = projectionMatrix[0][0];
-        float fy = projectionMatrix[1][1];
+        // Project covariance to screen space using the viewport so the result
+        // is in pixel units (gl_PointSize is pixels).
+        float fx = projectionMatrix[0][0] * viewport.x * 0.5;
+        float fy = projectionMatrix[1][1] * viewport.y * 0.5;
         float j0 = fx / z, j2 = -fx * mv.x / (z * z);
         float k1 = fy / z, k2 = -fy * mv.y / (z * z);
-        float a = j0*(j0*sxx + j2*sxz) + j2*(j0*sxz + j2*szz);
-        float b = k1*(j0*sxy + j2*syz) + k2*(j0*sxz + j2*szz);
-        float c = k1*(k1*syy + k2*syz) + k2*(k1*syz + k2*szz);
+        float a = j0 * (j0 * sxx + j2 * sxz) + j2 * (j0 * sxz + j2 * szz);
+        float b = k1 * (j0 * sxy + j2 * syz) + k2 * (j0 * sxz + j2 * szz);
+        float c = k1 * (k1 * syy + k2 * syz) + k2 * (k1 * syz + k2 * szz);
+        a += 0.3;
+        c += 0.3;
 
-        float det = a * c - b * b;
-        if (det <= 0.0) { a += 0.01; c += 0.01; det = a * c - b * b; }
-        float radius = 3.0 * sqrt(max((a + c) * 0.5, 0.001));
+        float mid = 0.5 * (a + c);
+        float disc = sqrt(max(0.25 * (a - c) * (a - c) + b * b, 0.0));
+        float lambdaMax = max(mid + disc, 0.01);
+        float radius = 3.0 * sqrt(lambdaMax);
+        radius = clamp(radius, 1.5, 96.0);
+
         vCov2D = vec2(a, c);
         vCov2D_b = b;
-        gl_PointSize = clamp(radius * 2.0, 2.0, 64.0);
+        vRadius = radius;
+        gl_PointSize = radius * 2.0;
       }
     `,
     fragmentShader: /* glsl */ `
       precision highp float;
       varying vec3 vColor;
+      varying float vAlpha;
       varying vec2 vCov2D;
       varying float vCov2D_b;
+      varying float vRadius;
       void main() {
-        vec2 d = gl_PointCoord * 2.0 - 1.0;
+        // Convert gl_PointCoord to a pixel-space offset from the splat center.
+        vec2 d = (gl_PointCoord * 2.0 - 1.0) * vRadius;
         float a = vCov2D.x, b = vCov2D_b, c = vCov2D.y;
         float det = a * c - b * b;
         if (det <= 0.0) discard;
         float m2 = (c * d.x * d.x - 2.0 * b * d.x * d.y + a * d.y * d.y) / det;
-        // Hard alpha test: opaque splats with depth write, no sorting needed.
-        float alpha = exp(-0.5 * m2);
-        if (alpha < 0.3) discard;
-        gl_FragColor = vec4(vColor, 1.0);
+        float alpha = vAlpha * exp(-0.5 * m2);
+        if (alpha < 0.01) discard;
+        gl_FragColor = vec4(vColor, alpha);
       }
     `,
   });
@@ -394,27 +499,69 @@ async function loadPly(path) {
     const buffer = await response.arrayBuffer();
     // buildGeometryFromPly handles binary 3DGS PLYs (SHARP output); everything
     // else (ASCII, mesh PLYs) falls back to Three.js's PLYLoader.
-    let geometry = buildGeometryFromPly(buffer);
-    if (geometry === null) {
-      const loader = new PLYLoader();
-      geometry = loader.parse(buffer);
-    }
     disposeCurrentMesh();
 
-    // Compute a robust frame from the dense core of the cloud. SHARP outputs
-    // have a few extreme outlier gaussians that inflate the true bounding box
-    // by 100x+, so the full bbox leaves the subject as a dot. We sample the
-    // positions, take the 5th-95th percentile box (the actual subject), and
-    // frame the camera around that.
-    const frame = computeRobustFrame(geometry);
-    const { center, size } = frame;
-    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    const is3dgsBinary = (function () {
+      // Quick header sniff: 3DGS PLYs have f_dc_* properties. We only need to
+      // know whether to route to GaussianSplats3D (URL-based) vs our parser.
+      const bytes = new Uint8Array(buffer);
+      const head = new TextDecoder("ascii").decode(bytes.slice(0, 2048));
+      return head.includes("f_dc_0") && head.includes("end_header");
+    })();
 
-    // 3DGS renders as a dense colored point cloud with soft circular points so
-    // adjacent gaussians blend into a surface (not rough square pixels). Mesh
-    // PLYs use a solid material; plain point clouds use PointsMaterial.
-    const is3dgs = geometry.userData.is3dgs;
-    const hasIndex = geometry.index !== null;
+    let geometry = null;
+    let frame = null;
+    if (!is3dgsBinary) {
+      geometry = buildGeometryFromPly(buffer);
+      if (geometry === null) {
+        const loader = new PLYLoader();
+        geometry = loader.parse(buffer);
+      }
+      frame = computeRobustFrame(geometry);
+    }
+
+    // 3DGS PLYs render through GaussianSplats3D (DropInViewer): a mature
+    // renderer with proper splat sorting, alpha blending, and EWA projection.
+    // Non-3DGS PLYs fall back to our Three.js point/mesh rendering.
+    const is3dgs = is3dgsBinary;
+    const hasIndex = geometry ? geometry.index !== null : false;
+    const maxDim = frame ? Math.max(frame.size.x, frame.size.y, frame.size.z) || 1 : 10;
+
+    if (is3dgs) {
+      // GaussianSplats3D Viewer in self-driven mode: it manages its own render
+      // loop, controls, and renderer on the canvas element. This is the
+      // documented simple path and avoids the integration stalls that happen
+      // when handing it an external renderer.
+      const canvas = $("viewerCanvas");
+      const wrap = canvas.parentElement;
+      const gsViewer = new Viewer({
+        selfDrivenMode: true,
+        useBuiltInControls: true,
+        sharedMemoryForWorkers: false,
+        gpuAcceleratedSort: false,
+        splatAlphaRemovalThreshold: 5,
+        rootElement: wrap,
+        cameraUp: [0, 1, 0],
+      });
+      state.currentMesh = gsViewer;
+      state.gsViewer = gsViewer;
+      window.__gsViewer = gsViewer; // debug hook
+      showViewerOverlay("Loading 3DGS via GaussianSplats3D…");
+      try {
+        await gsViewer.addSplatScene(`/api/ply-vertex-only?path=${encodeURIComponent(path)}`, {
+          showLoadingUI: false,
+        });
+        // Start the self-driven render loop (sorting + drawing) now that the
+        // splat scene is loaded.
+        gsViewer.start();
+        showViewerOverlay("3DGS loaded");
+      } catch (err) {
+        showViewerOverlay("Failed to load 3DGS");
+        showError(err.message || String(err));
+      }
+      return;
+    }
+
     let mesh;
     if (hasIndex) {
       mesh = new THREE.Mesh(
@@ -426,10 +573,6 @@ async function loadPly(path) {
           flatShading: true,
         })
       );
-    } else if (is3dgs) {
-      // True gaussian-splat rendering: each splat is an elliptical billboard
-      // sized by its projected 3D covariance, blending into a smooth surface.
-      mesh = new THREE.Points(geometry, createSplatMaterial());
     } else {
       const pointSize = Math.max(maxDim * 0.003, 0.005);
       mesh = new THREE.Points(
@@ -445,6 +588,7 @@ async function loadPly(path) {
       );
     }
 
+    const { center, size } = frame;
     // Re-center the subject at the origin so OrbitControls rotates around it.
     mesh.position.sub(center);
     state.scene.add(mesh);
@@ -465,8 +609,10 @@ async function loadPly(path) {
     const distForW = visibleW / (2 * Math.tan(fov / 2) * aspect);
     const fitDist = Math.max(distForH, distForW) * 1.2;
     state.camera.position.set(0, 0, fitDist);
-    state.camera.near = Math.max(fitDist * 0.01, 0.01);
-    state.camera.far = fitDist + size.z + 100;
+    // Wide near/far so the whole elongated scene stays visible when orbiting
+    // and zooming; SHARP scenes span a large z range.
+    state.camera.near = Math.max(fitDist * 0.001, 0.1);
+    state.camera.far = Math.max(fitDist, size.z) * 50 + 1000;
     state.camera.updateProjectionMatrix();
     state.controls.target.set(0, 0, 0);
     state.controls.update();

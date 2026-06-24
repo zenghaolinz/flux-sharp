@@ -85,6 +85,73 @@ def _extension_for_mime(mime_type: str, fallback_name: str) -> str:
     }.get(mime_type, ".png")
 
 
+def _strip_ply_to_vertex_only(data: bytes) -> bytes:
+    """Return a PLY containing only the `vertex` element.
+
+    SHARP PLYs append extrinsic/intrinsic/image_size/frame/disparity/color_space/
+    version elements after the vertex block. Some 3DGS renderers (e.g.
+    GaussianSplats3D) reject those as "unsupported format", so we strip them:
+    keep only `element vertex ...` properties + that element's binary body.
+    """
+    # Find the header end ("end_header\n").
+    sep = data.find(b"end_header")
+    if sep == -1:
+        return data
+    line_end = data.find(b"\n", sep)
+    if line_end == -1:
+        line_end = len(data)
+    header_text = data[: line_end + 1].decode("ascii", errors="replace")
+
+    header_lines = header_text.splitlines()
+    out_header = ["ply"]
+    vertex_count = 0
+    in_vertex = False
+    vertex_props = []
+    for line in header_lines[1:]:  # skip leading "ply"
+        if line.startswith("format "):
+            out_header.append(line)
+        elif line.startswith("comment "):
+            out_header.append(line)
+        elif line.startswith("element vertex "):
+            in_vertex = True
+            vertex_count = int(line.split()[2])
+            out_header.append(line)
+        elif line.startswith("element "):
+            in_vertex = False  # stop at the first non-vertex element
+        elif line.startswith("property ") and in_vertex:
+            out_header.append(line)
+    out_header.append("end_header")
+    new_header = "\n".join(out_header) + "\n"
+
+    # Determine bytes-per-vertex from the vertex properties (all float32 in
+    # SHARP output). Each "property float X" = 4 bytes; uint = 4; uchar = 1.
+    prop_size = {"float": 4, "double": 8, "uint": 4, "int": 4, "uchar": 1,
+                 "ushort": 2, "short": 2}
+    bytes_per_vertex = 0
+    for line in header_lines:
+        if line.startswith("property ") and (vertex_props or in_vertex):
+            parts = line.split()
+            if len(parts) >= 3:
+                bytes_per_vertex += prop_size.get(parts[1], 4)
+        if line.startswith("element ") and not line.startswith("element vertex"):
+            break
+    # Recompute properly: only count vertex properties.
+    bytes_per_vertex = 0
+    seen_vertex = False
+    for line in header_lines:
+        if line.startswith("element vertex "):
+            seen_vertex = True
+        elif line.startswith("element "):
+            seen_vertex = False
+        elif line.startswith("property ") and seen_vertex:
+            parts = line.split()
+            bytes_per_vertex += prop_size.get(parts[1], 4) if len(parts) >= 3 else 4
+
+    body_start = line_end + 1
+    vertex_body = data[body_start: body_start + vertex_count * bytes_per_vertex]
+    return new_header.encode("ascii") + vertex_body
+
+
 class FluxSharpHandler(BaseHTTPRequestHandler):
     server_version = "FluxSharpWeb/0.1"
 
@@ -103,6 +170,10 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 target = _safe_workspace_path(query.get("path", [""])[0])
                 self._serve_static(target)
+            elif parsed.path == "/api/ply-vertex-only":
+                query = parse_qs(parsed.query)
+                target = _safe_workspace_path(query.get("path", [""])[0])
+                self._serve_vertex_only_ply(target)
             elif parsed.path == "/api/comfyui-status":
                 self._send_json(
                     {"online": _comfyui_online(), "server": COMFYUI_SERVER}
@@ -318,6 +389,20 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(target.stat().st_size))
         self.end_headers()
         self.wfile.write(target.read_bytes())
+
+    def _serve_vertex_only_ply(self, path: Path) -> None:
+        # Serve a PLY with only the vertex element, stripped of SHARP's extra
+        # extrinsic/intrinsic/etc. elements so GaussianSplats3D can parse it.
+        target = path.resolve()
+        if not target.exists() or not target.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        stripped = _strip_ply_to_vertex_only(target.read_bytes())
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(stripped)))
+        self.end_headers()
+        self.wfile.write(stripped)
 
     def _send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = _json_bytes(data)
