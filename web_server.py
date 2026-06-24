@@ -10,15 +10,32 @@ from urllib.parse import parse_qs, quote, urlparse
 from uuid import uuid4
 
 from src.camera import CameraParams
+from src.comfyui_client import ComfyUIClient, ComfyUIError
 from src.pipeline import run_pipeline
 from src.renderers import create_render_backend
 from src.repair import create_repair_backend, load_repair_config
+from src.sharp_runner import SharpRunner
 
 
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
 UPLOAD_ROOT = ROOT / "web_uploads"
 OUTPUT_ROOT = ROOT / "outputs"
+
+# Shared SharpRunner singleton: one background worker for sharp predict jobs.
+SHARP_RUNNER = SharpRunner(output_root=OUTPUT_ROOT)
+COMFYUI_SERVER = "127.0.0.1:8188"
+
+
+def _comfyui_online() -> bool:
+    """Probe ComfyUI /system_stats with a short timeout. Never raises."""
+    try:
+        import requests
+
+        res = requests.get(f"http://{COMFYUI_SERVER}/system_stats", timeout=3)
+        return res.status_code == 200
+    except Exception:
+        return False
 
 
 def _json_bytes(data: Any) -> bytes:
@@ -86,6 +103,14 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 target = _safe_workspace_path(query.get("path", [""])[0])
                 self._serve_static(target)
+            elif parsed.path == "/api/comfyui-status":
+                self._send_json(
+                    {"online": _comfyui_online(), "server": COMFYUI_SERVER}
+                )
+            elif parsed.path == "/api/sharp/status":
+                self._sharp_status(parsed)
+            elif parsed.path == "/api/sharp/ply":
+                self._sharp_ply(parsed)
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
         except Exception as exc:
@@ -101,6 +126,10 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
                 self._export_camera(payload)
             elif parsed.path == "/api/run-preview":
                 self._run_preview(payload)
+            elif parsed.path == "/api/repair-screenshot":
+                self._repair_screenshot(payload)
+            elif parsed.path == "/api/sharp/generate":
+                self._sharp_generate(payload)
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
         except Exception as exc:
@@ -173,6 +202,104 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
                 "repair_url": f"/api/file?path={quote(str(result.repair_path))}",
                 "manifest_url": f"/api/file?path={quote(str(result.manifest_path))}",
             }
+        )
+
+    def _repair_screenshot(self, payload: dict[str, Any]) -> None:
+        # Browser-preview workflow: the front-end sends a canvas screenshot of
+        # the current Three.js view; we save it, upload it to ComfyUI, drive the
+        # FLUX.2 Klein workflow, and return the repaired image URL.
+        if "screenshot" not in payload:
+            raise ValueError("Missing 'screenshot' data URL in request body.")
+
+        session_id = payload.get("session_id") or uuid4().hex
+        run_dir = OUTPUT_ROOT / f"browser_{session_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        raw, _mime = _decode_upload(payload["screenshot"])
+        screenshot_path = run_dir / "browser_view.png"
+        screenshot_path.write_bytes(raw)
+
+        repair_path = run_dir / "repair_output.png"
+        workflow_path = ROOT / "FLUX.2+Klein+4B.json"
+
+        client = ComfyUIClient(server="127.0.0.1:8188")
+        client.run_flux2_klein_workflow(
+            workflow_path=workflow_path,
+            input_image_path=screenshot_path,
+            output_path=repair_path,
+            prompt=payload.get("prompt"),
+            seed=payload.get("seed"),
+            steps=payload.get("steps"),
+            megapixels=payload.get("megapixels"),
+        )
+
+        self._send_json(
+            {
+                "session_id": session_id,
+                "screenshot_path": str(screenshot_path),
+                "repair_path": str(repair_path),
+                "screenshot_url": f"/api/file?path={quote(str(screenshot_path))}",
+                "repair_url": f"/api/file?path={quote(str(repair_path))}",
+            }
+        )
+
+    def _sharp_generate(self, payload: dict[str, Any]) -> None:
+        # Accept an uploaded photo and queue a `sharp predict` job that turns it
+        # into a 3DGS .ply. Returns immediately with a job_id; the front-end
+        # polls /api/sharp/status.
+        if not SHARP_RUNNER.sharp_available():
+            raise RuntimeError(
+                "sharp CLI not found. Install apple/ml-sharp into .venv-sharp "
+                "or put `sharp` on PATH."
+            )
+        image_data = payload.get("imageData")
+        if not image_data:
+            raise ValueError("Missing 'imageData' data URL in request body.")
+        image_name = payload.get("imageName") or "upload.png"
+
+        raw, mime_type = _decode_upload(image_data)
+        suffix = _extension_for_mime(mime_type, image_name)
+        job_staging = OUTPUT_ROOT / "sharp_staging"
+        job_staging.mkdir(parents=True, exist_ok=True)
+        stem = Path(image_name).stem or "upload"
+        image_path = job_staging / f"{stem}_{uuid4().hex[:8]}{suffix}"
+        image_path.write_bytes(raw)
+
+        job = SHARP_RUNNER.submit(image_path)
+        self._send_json(
+            {
+                "job_id": job.job_id,
+                "image_path": str(image_path),
+                "image_url": f"/api/file?path={quote(str(image_path))}",
+                "state": job.snapshot()["state"],
+            }
+        )
+
+    def _sharp_status(self, parsed: Any) -> None:
+        query = parse_qs(parsed.query)
+        job_id = query.get("job_id", [""])[0]
+        status = SHARP_RUNNER.get_status(job_id)
+        if status is None:
+            raise ValueError(f"Unknown sharp job_id: {job_id}")
+        ply_path = status.get("ply_path")
+        if ply_path:
+            status["ply_url"] = f"/api/file?path={quote(str(ply_path))}"
+        status["sharp_available"] = SHARP_RUNNER.sharp_available()
+        self._send_json(status)
+
+    def _sharp_ply(self, parsed: Any) -> None:
+        query = parse_qs(parsed.query)
+        job_id = query.get("job_id", [""])[0]
+        status = SHARP_RUNNER.get_status(job_id)
+        if status is None:
+            raise ValueError(f"Unknown sharp job_id: {job_id}")
+        if status["state"] != "done" or not status.get("ply_path"):
+            raise RuntimeError(
+                f"PLY not ready for job {job_id} (state={status['state']})."
+            )
+        ply_url = f"/api/file?path={quote(str(status['ply_path']))}"
+        self._send_json(
+            {"job_id": job_id, "ply_path": status["ply_path"], "ply_url": ply_url}
         )
 
     def _read_json(self) -> dict[str, Any]:

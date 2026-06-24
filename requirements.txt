@@ -3,3 +3,5 @@ open3d>=0.18
 Pillow>=10.0
 pytest>=8.0
 huggingface-hub>=0.35
+requests>=2.31
+websocket-client>=1.7
