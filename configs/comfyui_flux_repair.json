@@ -1,0 +1,16 @@
+{
+  "server_url": "http://127.0.0.1:8189",
+  "input_dir": "D:/ComfyUI_flux_sharp_exp/ComfyUI/input",
+  "output_dir": "D:/ComfyUI_flux_sharp_exp/ComfyUI/output",
+  "unet_name": "flux-2-klein-9b-Q4_K_M.gguf",
+  "clip_name": "qwen_3_8b_fp8mixed.safetensors",
+  "vae_name": "flux2-vae.safetensors",
+  "lora_name": "flux.2-klein-9B--vggt-splat-render-v1.safetensors",
+  "lora_strength": 1.0,
+  "steps": 8,
+  "cfg": 1.0,
+  "sampler_name": "euler",
+  "timeout_seconds": 900,
+  "poll_seconds": 2.0,
+  "free_memory": true
+}

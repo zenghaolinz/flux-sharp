@@ -1,0 +1,8 @@
+{
+  "key": "vggt-splat-render",
+  "repo_id": "cyburn/vggt-splat-render",
+  "filename": "flux.2-klein-9B--vggt-splat-render-v1.safetensors",
+  "local_path": "models\\vggt\\flux.2-klein-9B--vggt-splat-render-v1.safetensors",
+  "license": "apache-2.0",
+  "notes": "Candidate first repair/enhancement LoRA. Inference contract still needs validation."
+}

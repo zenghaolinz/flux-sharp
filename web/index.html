@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Flux Sharp Camera</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f4f6f8;
+        --panel: #ffffff;
+        --ink: #1e252b;
+        --muted: #66717c;
+        --line: #d7dee5;
+        --accent: #0f766e;
+        --accent-2: #c2410c;
+        --soft: #e8f3f1;
+        --shadow: 0 10px 24px rgba(31, 41, 55, 0.09);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: Inter, "Segoe UI", system-ui, sans-serif;
+        letter-spacing: 0;
+      }
+
+      button,
+      input,
+      select,
+      textarea {
+        font: inherit;
+      }
+
+      .shell {
+        min-height: 100vh;
+        display: grid;
+        grid-template-columns: 300px minmax(420px, 1fr) 360px;
+        gap: 1px;
+        background: var(--line);
+      }
+
+      .panel {
+        background: var(--panel);
+        min-width: 0;
+        padding: 18px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding-bottom: 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .brand h1 {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 700;
+      }
+
+      .status-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        background: #a3aab2;
+      }
+
+      .status-dot.ready {
+        background: var(--accent);
+      }
+
+      .section {
+        padding: 18px 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .section:last-child {
+        border-bottom: 0;
+      }
+
+      .section h2 {
+        margin: 0 0 12px;
+        font-size: 13px;
+        text-transform: uppercase;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      .drop {
+        display: grid;
+        place-items: center;
+        min-height: 160px;
+        border: 1px dashed #9aa6b2;
+        background: #fafbfc;
+        border-radius: 8px;
+        padding: 16px;
+        text-align: center;
+        cursor: pointer;
+      }
+
+      .drop input {
+        display: none;
+      }
+
+      .drop strong {
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .drop span,
+      .hint,
+      .meta {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      .preview-img {
+        width: 100%;
+        max-height: 220px;
+        object-fit: contain;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #f9fafb;
+        display: none;
+      }
+
+      .field {
+        display: grid;
+        gap: 8px;
+        margin-bottom: 14px;
+      }
+
+      label {
+        font-size: 13px;
+        color: var(--muted);
+        font-weight: 600;
+      }
+
+      select,
+      textarea,
+      input[type="number"] {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: white;
+        color: var(--ink);
+        padding: 9px 10px;
+      }
+
+      textarea {
+        min-height: 92px;
+        resize: vertical;
+      }
+
+      .stage {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        gap: 16px;
+        min-height: 100vh;
+      }
+
+      .toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .toolbar h2 {
+        margin: 0;
+        font-size: 18px;
+      }
+
+      .canvas-wrap {
+        position: relative;
+        min-height: 460px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background:
+          linear-gradient(90deg, rgba(15, 118, 110, 0.08) 1px, transparent 1px),
+          linear-gradient(rgba(15, 118, 110, 0.08) 1px, transparent 1px),
+          #fbfcfd;
+        background-size: 36px 36px;
+      }
+
+      canvas {
+        width: 100%;
+        height: 100%;
+        min-height: 460px;
+        display: block;
+        cursor: grab;
+      }
+
+      canvas:active {
+        cursor: grabbing;
+      }
+
+      .readout {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .metric {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px;
+        background: #fbfcfd;
+      }
+
+      .metric span {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+        margin-bottom: 6px;
+      }
+
+      .metric strong {
+        font-size: 16px;
+      }
+
+      .slider {
+        display: grid;
+        grid-template-columns: 64px 1fr 58px;
+        gap: 10px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+
+      input[type="range"] {
+        width: 100%;
+        accent-color: var(--accent);
+      }
+
+      .buttons {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+
+      .button {
+        border: 1px solid transparent;
+        border-radius: 7px;
+        padding: 10px 12px;
+        background: var(--accent);
+        color: white;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      .button.secondary {
+        background: white;
+        color: var(--ink);
+        border-color: var(--line);
+      }
+
+      .button.warn {
+        background: var(--accent-2);
+      }
+
+      .button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+
+      pre {
+        margin: 0;
+        max-height: 220px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: #101820;
+        color: #d7f8ea;
+        border-radius: 8px;
+        padding: 12px;
+        font-size: 12px;
+      }
+
+      .output {
+        display: grid;
+        gap: 12px;
+      }
+
+      .output img {
+        width: 100%;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: #f9fafb;
+      }
+
+      .steps {
+        display: grid;
+        gap: 10px;
+      }
+
+      .step {
+        display: grid;
+        grid-template-columns: 24px 1fr;
+        gap: 10px;
+        align-items: start;
+      }
+
+      .step b {
+        display: grid;
+        place-items: center;
+        width: 24px;
+        height: 24px;
+        border-radius: 999px;
+        background: var(--soft);
+        color: var(--accent);
+        font-size: 12px;
+      }
+
+      @media (max-width: 1100px) {
+        .shell {
+          grid-template-columns: 1fr;
+        }
+
+        .stage,
+        .panel {
+          min-height: auto;
+        }
+
+        .readout {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="panel">
+        <div class="brand">
+          <h1>Flux Sharp</h1>
+          <span id="healthDot" class="status-dot" title="API status"></span>
+        </div>
+
+        <section class="section">
+          <h2>输入</h2>
+          <label class="drop" id="drop">
+            <input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp" />
+            <span>
+              <strong>上传参考图</strong>
+              <span>第一版会保存图片，并把它作为后续图生 PLY / ComfyUI 修复参考。</span>
+            </span>
+          </label>
+          <img id="referencePreview" class="preview-img" alt="reference preview" />
+          <p id="sessionMeta" class="meta"></p>
+        </section>
+
+        <section class="section">
+          <h2>场景</h2>
+          <div class="field">
+            <label for="plySelect">PLY 文件</label>
+            <select id="plySelect"></select>
+          </div>
+          <div class="field">
+            <label for="rendererSelect">渲染器</label>
+            <select id="rendererSelect">
+              <option value="software">software preview</option>
+              <option value="auto">auto</option>
+              <option value="sharp-cli">sharp-cli</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="repairSelect">修复后端</label>
+            <select id="repairSelect">
+              <option value="comfyui-flux">ComfyUI Flux repair</option>
+              <option value="dummy">dummy copy</option>
+            </select>
+          </div>
+          <p class="hint">图生 PLY 接口接入后，这里会自动指向新生成的 PLY。现在可用已有 PLY 做相机与渲染闭环。</p>
+        </section>
+
+        <section class="section">
+          <h2>提示词</h2>
+          <textarea id="prompt">refer to image 2, fix the distortion and blank areas in image 1</textarea>
+        </section>
+      </aside>
+
+      <section class="panel stage">
+        <div class="toolbar">
+          <h2>摄像机视角</h2>
+          <div class="buttons" style="grid-template-columns: auto auto;">
+            <button id="resetBtn" class="button secondary" type="button">重置</button>
+            <button id="exportBtn" class="button" type="button">导出坐标</button>
+          </div>
+        </div>
+
+        <div class="canvas-wrap">
+          <canvas id="cameraCanvas" width="900" height="560" aria-label="camera orbit control"></canvas>
+        </div>
+
+        <div class="readout">
+          <div class="metric"><span>Yaw</span><strong id="yawOut">0</strong></div>
+          <div class="metric"><span>Pitch</span><strong id="pitchOut">0</strong></div>
+          <div class="metric"><span>Radius</span><strong id="radiusOut">2.5</strong></div>
+          <div class="metric"><span>FOV</span><strong id="fovOut">45</strong></div>
+          <div class="metric"><span>Size</span><strong id="sizeOut">1024</strong></div>
+        </div>
+      </section>
+
+      <aside class="panel">
+        <section class="section">
+          <h2>参数</h2>
+          <div id="sliders"></div>
+          <div class="buttons">
+            <button id="runBtn" class="button warn" type="button">运行预览</button>
+            <button id="copyBtn" class="button secondary" type="button">复制 JSON</button>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>坐标 JSON</h2>
+          <pre id="cameraJson"></pre>
+        </section>
+
+        <section class="section">
+          <h2>流程</h2>
+          <div class="steps">
+            <div class="step"><b>1</b><span class="hint">图片上传并保存为参考图</span></div>
+            <div class="step"><b>2</b><span class="hint">图生 PLY，当前先用已有 PLY 占位</span></div>
+            <div class="step"><b>3</b><span class="hint">摄像机控件导出结构化相机参数</span></div>
+            <div class="step"><b>4</b><span class="hint">后端渲染 raw view，再交给 ComfyUI 修复</span></div>
+          </div>
+        </section>
+
+        <section class="section output" id="outputSection" style="display: none;">
+          <h2>输出</h2>
+          <img id="repairOutput" alt="repair output" />
+          <p id="outputMeta" class="meta"></p>
+        </section>
+      </aside>
+    </main>
+
+    <script>
+      const state = {
+        sessionId: null,
+        referenceImage: null,
+        camera: {
+          x: 0,
+          y: 0,
+          z: 2.5,
+          pitch: 0,
+          yaw: 0,
+          roll: 0,
+          fov: 45,
+          width: 1024,
+          height: 1024,
+        },
+      };
+
+      const sliders = [
+        ["yaw", "Yaw", -180, 180, 1],
+        ["pitch", "Pitch", -75, 75, 1],
+        ["roll", "Roll", -45, 45, 1],
+        ["z", "Radius", 0.5, 8, 0.1],
+        ["fov", "FOV", 20, 100, 1],
+        ["width", "Width", 256, 1536, 64],
+        ["height", "Height", 256, 1536, 64],
+      ];
+
+      const $ = (id) => document.getElementById(id);
+
+      async function api(path, options = {}) {
+        const res = await fetch(path, {
+          headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+          ...options,
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.message || res.statusText);
+        return data;
+      }
+
+      function cameraJson() {
+        return JSON.stringify(state.camera, null, 2);
+      }
+
+      function updateReadout() {
+        $("yawOut").textContent = `${state.camera.yaw.toFixed(0)}°`;
+        $("pitchOut").textContent = `${state.camera.pitch.toFixed(0)}°`;
+        $("radiusOut").textContent = state.camera.z.toFixed(1);
+        $("fovOut").textContent = `${state.camera.fov.toFixed(0)}°`;
+        $("sizeOut").textContent = `${state.camera.width}×${state.camera.height}`;
+        $("cameraJson").textContent = cameraJson();
+        for (const [key] of sliders) {
+          const input = document.querySelector(`[data-key="${key}"]`);
+          const value = document.querySelector(`[data-value="${key}"]`);
+          if (input) input.value = state.camera[key];
+          if (value) value.textContent = state.camera[key];
+        }
+        drawCamera();
+      }
+
+      function buildSliders() {
+        $("sliders").innerHTML = sliders.map(([key, label, min, max, step]) => `
+          <div class="slider">
+            <label for="slider-${key}">${label}</label>
+            <input id="slider-${key}" data-key="${key}" type="range" min="${min}" max="${max}" step="${step}" value="${state.camera[key]}" />
+            <span class="meta" data-value="${key}">${state.camera[key]}</span>
+          </div>
+        `).join("");
+        $("sliders").addEventListener("input", (event) => {
+          const key = event.target.dataset.key;
+          if (!key) return;
+          state.camera[key] = Number(event.target.value);
+          updateReadout();
+        });
+      }
+
+      function drawCamera() {
+        const canvas = $("cameraCanvas");
+        const ctx = canvas.getContext("2d");
+        const width = canvas.width;
+        const height = canvas.height;
+        ctx.clearRect(0, 0, width, height);
+
+        const center = { x: width / 2, y: height / 2 };
+        const radius = Math.min(width, height) * 0.28;
+        const yaw = (state.camera.yaw * Math.PI) / 180;
+        const pitch = (state.camera.pitch * Math.PI) / 180;
+        const cam = {
+          x: center.x + Math.sin(yaw) * radius,
+          y: center.y - Math.sin(pitch) * radius * 0.75,
+        };
+
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "#c7d1da";
+        ctx.beginPath();
+        ctx.ellipse(center.x, center.y, radius, radius * 0.38, 0, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.strokeStyle = "#0f766e";
+        ctx.beginPath();
+        ctx.moveTo(cam.x, cam.y);
+        ctx.lineTo(center.x, center.y);
+        ctx.stroke();
+
+        ctx.fillStyle = "#1e252b";
+        ctx.fillRect(center.x - 42, center.y - 28, 84, 56);
+        ctx.fillStyle = "#eef2f5";
+        ctx.fillRect(center.x - 28, center.y - 18, 56, 36);
+
+        ctx.save();
+        ctx.translate(cam.x, cam.y);
+        ctx.rotate(yaw * 0.2);
+        ctx.fillStyle = "#c2410c";
+        ctx.beginPath();
+        ctx.moveTo(0, -22);
+        ctx.lineTo(30, 0);
+        ctx.lineTo(0, 22);
+        ctx.lineTo(-18, 14);
+        ctx.lineTo(-18, -14);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+
+        ctx.fillStyle = "#0f766e";
+        ctx.beginPath();
+        ctx.arc(cam.x, cam.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      function setupCanvasDrag() {
+        const canvas = $("cameraCanvas");
+        let dragging = false;
+        let last = null;
+        canvas.addEventListener("pointerdown", (event) => {
+          dragging = true;
+          last = { x: event.clientX, y: event.clientY };
+          canvas.setPointerCapture(event.pointerId);
+        });
+        canvas.addEventListener("pointermove", (event) => {
+          if (!dragging) return;
+          const dx = event.clientX - last.x;
+          const dy = event.clientY - last.y;
+          state.camera.yaw = clamp(state.camera.yaw + dx * 0.6, -180, 180);
+          state.camera.pitch = clamp(state.camera.pitch - dy * 0.5, -75, 75);
+          last = { x: event.clientX, y: event.clientY };
+          updateReadout();
+        });
+        canvas.addEventListener("pointerup", () => {
+          dragging = false;
+        });
+      }
+
+      function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+      }
+
+      async function refreshPlyFiles() {
+        const data = await api("/api/ply-files");
+        $("plySelect").innerHTML = data.files.map((file) =>
+          `<option value="${file.path}">${file.name}</option>`
+        ).join("");
+      }
+
+      async function createSession(file) {
+        const reader = new FileReader();
+        const imageData = await new Promise((resolve, reject) => {
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+        const data = await api("/api/sessions", {
+          method: "POST",
+          body: JSON.stringify({ imageName: file.name, imageData }),
+        });
+        state.sessionId = data.session_id;
+        state.referenceImage = data.reference_image;
+        $("sessionMeta").textContent = `session ${data.session_id.slice(0, 8)} · ${file.name}`;
+        $("referencePreview").src = imageData;
+        $("referencePreview").style.display = "block";
+        if (data.ply_files?.length) {
+          $("plySelect").innerHTML = data.ply_files.map((item) =>
+            `<option value="${item.path}">${item.name}</option>`
+          ).join("");
+        }
+      }
+
+      async function exportCamera() {
+        if (!state.sessionId) {
+          const data = await api("/api/sessions", { method: "POST", body: "{}" });
+          state.sessionId = data.session_id;
+          $("sessionMeta").textContent = `session ${data.session_id.slice(0, 8)}`;
+        }
+        const data = await api("/api/export-camera", {
+          method: "POST",
+          body: JSON.stringify({ session_id: state.sessionId, camera: state.camera }),
+        });
+        $("sessionMeta").textContent = `camera saved · ${data.camera_path}`;
+      }
+
+      async function runPreview() {
+        if ($("repairSelect").value === "comfyui-flux" && !state.referenceImage) {
+          alert("ComfyUI 修复需要先上传参考图。");
+          return;
+        }
+        $("runBtn").disabled = true;
+        $("runBtn").textContent = "运行中";
+        try {
+          await exportCamera();
+          const data = await api("/api/run-preview", {
+            method: "POST",
+            body: JSON.stringify({
+              session_id: state.sessionId,
+              ply_path: $("plySelect").value,
+              renderer: $("rendererSelect").value,
+              repair_backend: $("repairSelect").value,
+              reference_image: state.referenceImage,
+              camera: state.camera,
+              prompt: $("prompt").value,
+            }),
+          });
+          $("outputSection").style.display = "grid";
+          $("repairOutput").src = `${data.repair_url}&t=${Date.now()}`;
+          $("outputMeta").textContent = `${data.run_dir} · raw: ${data.render_path}`;
+        } finally {
+          $("runBtn").disabled = false;
+          $("runBtn").textContent = "运行预览";
+        }
+      }
+
+      async function init() {
+        buildSliders();
+        setupCanvasDrag();
+        updateReadout();
+        try {
+          await api("/api/health");
+          $("healthDot").classList.add("ready");
+        } catch {
+          $("healthDot").classList.remove("ready");
+        }
+        await refreshPlyFiles();
+        $("imageInput").addEventListener("change", (event) => {
+          const file = event.target.files[0];
+          if (file) createSession(file).catch(alert);
+        });
+        $("resetBtn").addEventListener("click", () => {
+          Object.assign(state.camera, { x: 0, y: 0, z: 2.5, pitch: 0, yaw: 0, roll: 0, fov: 45, width: 1024, height: 1024 });
+          updateReadout();
+        });
+        $("exportBtn").addEventListener("click", () => exportCamera().catch(alert));
+        $("copyBtn").addEventListener("click", () => navigator.clipboard.writeText(cameraJson()));
+        $("runBtn").addEventListener("click", () => runPreview().catch((err) => alert(err.message)));
+      }
+
+      init().catch((err) => alert(err.message));
+    </script>
+  </body>
+</html>

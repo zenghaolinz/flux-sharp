@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.venv-sharp/
+venv/
+
+# Server runtime logs
+web_server.err.log
+web_server.out.log
+
+# Web UI session uploads (user reference images + camera json)
+web_uploads/*
+!web_uploads/.gitkeep
+
+outputs/*
+!outputs/.gitkeep
+
+# Large sample PLY (63MB) - keep out of the repo
+inputs/IMG_0638.ply
+
+models/**/*.safetensors
+models/**/*.ckpt
+models/**/*.bin

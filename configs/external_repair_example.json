@@ -1,0 +1,12 @@
+{
+  "command": [
+    "python",
+    "scripts/example_repair_copy.py",
+    "--input",
+    "{input_image}",
+    "--output",
+    "{output_image}"
+  ],
+  "working_dir": ".",
+  "timeout_seconds": 300
+}
