@@ -16,8 +16,9 @@ web_uploads/*
 outputs/*
 !outputs/.gitkeep
 
-# Large sample PLY (63MB) - keep out of the repo
-inputs/IMG_0638.ply
+# PLY files (test data, 63MB each) - keep out of the repo
+inputs/*.ply
+scripts/cleanup_plies.py
 
 models/**/*.safetensors
 models/**/*.ckpt
