@@ -60,9 +60,18 @@ class SharpJob:
 class SharpRunner:
     """Singleton that runs one ``sharp predict`` at a time on a worker thread."""
 
-    def __init__(self, output_root: Path, sharp_exe: Path | None = None) -> None:
+    def __init__(
+        self,
+        output_root: Path,
+        inputs_root: Path | None = None,
+        sharp_exe: Path | None = None,
+    ) -> None:
         self.output_root = output_root
         self.output_root.mkdir(parents=True, exist_ok=True)
+        # Where to copy finished PLYs so they appear in the WebUI file list.
+        self.inputs_root = inputs_root
+        if self.inputs_root is not None:
+            self.inputs_root.mkdir(parents=True, exist_ok=True)
         self._sharp_exe = sharp_exe or _resolve_sharp_executable()
         self._jobs: dict[str, SharpJob] = {}
         self._lock = threading.Lock()
@@ -160,6 +169,22 @@ class SharpRunner:
             with job._lock:
                 job.state = STATE_DONE
                 job.ply_path = ply_path
+
+            # Copy the finished PLY into inputs/ so the WebUI PLY dropdown
+            # picks it up automatically (the dropdown only scans inputs/).
+            if self.inputs_root is not None:
+                try:
+                    dest = self.inputs_root / ply_path.name
+                    shutil.copy2(ply_path, dest)
+                    with job._lock:
+                        job.ply_path = dest
+                except OSError as copy_err:
+                    # Non-fatal: the original output path still works for
+                    # direct loading; just log the copy failure.
+                    with job._lock:
+                        job.log += (
+                            f"\n[warn] failed to copy PLY to inputs/: {copy_err}"
+                        )
         except subprocess.TimeoutExpired:
             with job._lock:
                 job.state = STATE_FAILED

@@ -1,636 +1,54 @@
-// Browser PLY preview + screenshot-to-ComfyUI repair flow.
-// Loads a selected PLY with Three.js + PLYLoader, lets the user orbit with
-// OrbitControls, then captures the canvas and sends it to /api/repair-screenshot.
+// Flux Sharp — Photo → SHARP 3DGS → 3D Preview → Screenshot → ComfyUI Repair
+//
+// Flow:
+//   1. Upload photo
+//   2. SHARP generates PLY from photo
+//   3. PLY loaded in GaussianSplats3D viewer (user adjusts camera)
+//   4. Screenshot current view → send to ComfyUI for repair
+//   5. Compare (screenshot vs repair) / Export repair result
 
 import * as THREE from "three";
-import { OrbitControls } from "/web/vendor/OrbitControls.js";
-import { PLYLoader } from "/web/vendor/PLYLoader.js";
-import { Viewer } from "@mkkellogg/gaussian-splats-3d";
+import { Viewer, SceneFormat } from "/web/vendor/gaussian-splats-3d.module.js";
 
-// Debug switch: when true, 3DGS PLYs render as a plain colored point cloud
-// (PointsMaterial) to verify the parser, f_dc->RGB color, coordinate flip, and
-// camera framing are correct — independent of the splat shader. If this mode
-// shows a colored subject, the bug is in createSplatMaterial; if it's still
-// grey/white dots, the bug is in the parser/framing.
-const DEBUG_POINT_PREVIEW = false;
-
+// ---------------------------------------------------------------------------
+// DOM helpers
+// ---------------------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
 
+// ---------------------------------------------------------------------------
+// Hardcoded repair prompt (sent to ComfyUI, not shown to user)
+// ---------------------------------------------------------------------------
+const REPAIR_PROMPT = `请将这张高斯泼溅、点云渲染或三维重建图像修复成一张干净、真实、自然的照片。
+
+请去除图像中的重建伪影与结构错误，包括但不限于：点状噪声、黑灰色颗粒、雾状拖影、半透明残影、破碎边缘、孔洞、模糊块、漂浮碎片、错误的深度层次、边缘污染、网格背景、不完整几何结构、局部拉伸、重影和错位。
+
+请同时修复人物与物体的局部畸变问题，包括人脸畸变、五官错位、面部模糊、手部变形、手指数量异常、肢体扭曲、人体结构错误、重复人物、重复肢体，以及物体形状破损、弯折、融化、断裂或不连贯的问题。
+
+如果图像中包含文字、标牌、屏幕或建筑细节，请尽可能恢复其合理结构，避免出现扭曲文字、错误字符、模糊标识和不自然的细节。
+
+请根据原图中已有的内容、透视关系、光照方向、颜色风格和空间结构，自然补全缺失区域。补全结果要符合真实世界逻辑，主体完整，边缘干净，材质真实，空间连续，远近关系合理。
+
+请保持原始构图、相机视角、主体位置、场景布局和整体氛围不变。不要随意改变主体，不要添加无关物体，不要改变拍摄角度，也不要把原图重构成完全不同的场景。
+
+修复后的图像应像真实相机或手机拍摄的照片，光照自然，色彩统一，细节清晰但不过度锐化，纹理真实，几何稳定，没有明显的 AI 修复痕迹。`;
+
+// ---------------------------------------------------------------------------
+// Application state
+// ---------------------------------------------------------------------------
 const state = {
-  // Three.js scene objects, created in initViewer().
-  scene: null,
-  camera: null,
-  renderer: null,
-  controls: null,
-  currentMesh: null,
+  photoWidth: 0,        // original photo width (px)
+  photoHeight: 0,       // original photo height (px)
+  photoDataUrl: null,   // uploaded photo data URL
+  photoName: null,      // original filename
+  plyPath: null,        // generated PLY path from SHARP
+  plyUrl: null,         // PLY URL for loading into viewer
+  viewer: null,         // GaussianSplats3D Viewer instance
+  disposePromise: null,  // pending viewer disposal promise
+  screenshotUrl: null,  // canvas screenshot URL (from ComfyUI response)
+  repairUrl: null,      // repair result URL
+  comparing: false,     // true = showing screenshot, false = showing repair
+  inRepairView: false,  // true = repair result is showing, preview image overlays canvas
 };
-
-// ---------------------------------------------------------------------------
-// Three.js viewer
-// ---------------------------------------------------------------------------
-function initViewer() {
-  const canvas = $("viewerCanvas");
-  const wrap = canvas.parentElement;
-
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x1a1f24);
-
-  const camera = new THREE.PerspectiveCamera(45, wrap.clientWidth / wrap.clientHeight, 0.01, 1000);
-  camera.position.set(0, 0, 3);
-
-  // preserveDrawingBuffer is required so canvas.toDataURL() returns a stable
-  // screenshot after a manual render() call. powerPreference forces the
-  // discrete GPU on dual-GPU laptops (Chrome otherwise pins WebGL to the
-  // Intel iGPU, which is slow and janky for >1M points).
-  const renderer = new THREE.WebGLRenderer({
-    canvas,
-    antialias: true,
-    preserveDrawingBuffer: true,
-    powerPreference: "high-performance",
-  });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.setSize(wrap.clientWidth, wrap.clientHeight, false);
-
-  const controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
-  controls.dampingFactor = 0.1;
-  // Re-render on interaction for the on-demand loop.
-  controls.addEventListener("change", requestRender);
-  controls.addEventListener("start", requestRender);
-
-  // Soft lighting so unlit PLY point clouds are still readable.
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0));
-  const dir = new THREE.DirectionalLight(0xffffff, 1.0);
-  dir.position.set(2, 3, 2);
-  scene.add(dir);
-
-  state.scene = scene;
-  state.camera = camera;
-  state.renderer = renderer;
-  state.controls = controls;
-
-  // If the GPU drops the WebGL context (heavy scenes on weak drivers), restore
-  // and re-render once it comes back so the viewer isn't left blank.
-  renderer.domElement.addEventListener("webglcontextlost", (e) => {
-    e.preventDefault();
-  });
-  renderer.domElement.addEventListener("webglcontextrestored", () => {
-    requestRender();
-  });
-
-  window.addEventListener("resize", onResize);
-  startAnimation();
-}
-
-function onResize() {
-  const wrap = $("viewerCanvas").parentElement;
-  state.camera.aspect = wrap.clientWidth / wrap.clientHeight;
-  state.camera.updateProjectionMatrix();
-  state.renderer.setSize(wrap.clientWidth, wrap.clientHeight, false);
-  updateViewportUniform();
-  requestRender();
-}
-
-// Keep the splat shader's viewport uniform in sync with the canvas size; it's
-// needed to convert projected covariance into pixel-space gl_PointSize.
-function updateViewportUniform() {
-  const material = state.currentMesh?.material;
-  if (material?.uniforms?.viewport) {
-    const canvas = state.renderer.domElement;
-    material.uniforms.viewport.value.set(canvas.width, canvas.height);
-  }
-}
-
-// Render only when needed (orbit interaction or damping tail) to keep a >1M
-// splat scene responsive instead of redrawing every frame.
-let continuousRenderId = null;
-function startContinuousRender() {
-  if (continuousRenderId) return;
-  const loop = () => {
-    continuousRenderId = requestAnimationFrame(loop);
-    state.controls.update();
-    if (state.currentMesh?.update) {
-      state.currentMesh.update();
-    }
-    state.renderer.render(state.scene, state.camera);
-  };
-  continuousRenderId = requestAnimationFrame(loop);
-}
-function stopContinuousRender() {
-  if (continuousRenderId) {
-    cancelAnimationFrame(continuousRenderId);
-    continuousRenderId = null;
-  }
-}
-
-let renderQueued = false;
-function requestRender() {
-  if (renderQueued) return;
-  renderQueued = true;
-  requestAnimationFrame(() => {
-    renderQueued = false;
-    state.controls.update();
-    // GaussianSplats3D needs a per-frame update() for splat sorting.
-    if (state.currentMesh?.update) {
-      state.currentMesh.update();
-    }
-    state.renderer.render(state.scene, state.camera);
-    // Keep the damping tail animating until controls settle.
-    startAnimation();
-  });
-}
-
-function animate() {
-  // controls.update() returns true while damping is still settling; keep
-  // rendering until it stops, then the loop idles at ~zero cost.
-  if (state.controls.update()) {
-    state.renderer.render(state.scene, state.camera);
-    requestAnimationFrame(animate);
-  }
-}
-
-function startAnimation() {
-  requestAnimationFrame(animate);
-}
-
-function disposeCurrentMesh() {
-  stopContinuousRender();
-  const m = state.currentMesh;
-  if (m) {
-    // GaussianSplats3D Viewer: dispose its resources; for regular meshes,
-    // remove from scene and dispose geometry/material.
-    if (m.dispose) {
-      m.dispose();
-    } else {
-      state.scene.remove(m);
-      m.geometry?.dispose();
-      m.material?.dispose();
-    }
-    state.currentMesh = null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// PLY parsing (3DGS-aware)
-// ---------------------------------------------------------------------------
-// Three.js's PLYLoader ignores 3DGS-specific properties (f_dc_*, opacity,
-// scale_*, rot_*), so a SHARP output renders as a near-invisible uncolored
-// point cloud. This parser reads the binary vertex block directly and converts
-// the spherical-harmonics DC coefficients into RGB plus opacity into alpha.
-const SH_C0 = 0.28209479177387814; // 1/(2*sqrt(pi))
-
-function buildGeometryFromPly(buffer) {
-  const bytes = new Uint8Array(buffer);
-  // Parse the ASCII header up to "end_header".
-  let offset = 0;
-  const decoder = new TextDecoder("ascii");
-  const headerLines = [];
-  while (offset < bytes.length) {
-    const nl = bytes.indexOf(10, offset); // '\n'
-    const lineBytes = nl === -1 ? bytes.slice(offset) : bytes.slice(offset, nl);
-    const line = decoder.decode(lineBytes).replace(/\r$/, "");
-    offset = nl === -1 ? bytes.length : nl + 1;
-    headerLines.push(line);
-    if (line.trim() === "end_header") break;
-  }
-
-  // Collect vertex property names + types in declaration order.
-  let inVertex = false;
-  const props = [];
-  const propTypes = [];
-  let vertexCount = 0;
-  let isBinary = false;
-  let littleEndian = true;
-  for (const line of headerLines) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith("format")) {
-      isBinary = trimmed.includes("binary");
-      littleEndian = trimmed.includes("little_endian");
-    } else if (trimmed.startsWith("element vertex ")) {
-      inVertex = true;
-      vertexCount = parseInt(trimmed.split(/\s+/)[2], 10);
-    } else if (trimmed.startsWith("element ")) {
-      inVertex = false; // extrinsic/intrinsic/frame/etc.
-    } else if (trimmed.startsWith("property") && inVertex) {
-      const parts = trimmed.split(/\s+/);
-      propTypes.push(parts[1]);
-      props.push(parts[parts.length - 1]);
-    }
-  }
-
-  const is3dgs =
-    props.includes("f_dc_0") && props.includes("f_dc_1") && props.includes("f_dc_2");
-
-  // Only the binary 3DGS path is handled here; ASCII / non-3DGS PLYs fall back
-  // to Three.js's PLYLoader.
-  if (!isBinary || !is3dgs) return null;
-
-  const propIndex = {};
-  props.forEach((p, i) => (propIndex[p] = i));
-  const stride = props.length * 4; // SHARP writes all vertex props as float32
-  const view = new DataView(buffer, offset);
-
-  // First pass: count visible splats (alpha above threshold) so we can drop the
-  // ~35% near-transparent gaussians that only waste fill rate.
-  const alphaThreshold = 0.05;
-  let visibleCount = 0;
-  const alphas = new Float32Array(vertexCount);
-  for (let i = 0; i < vertexCount; i++) {
-    const base = i * stride;
-    let alpha = 1;
-    if ("opacity" in propIndex) {
-      const o = view.getFloat32(base + propIndex["opacity"] * 4, littleEndian);
-      alpha = 1 / (1 + Math.exp(-o));
-    }
-    alphas[i] = alpha;
-    if (alpha > alphaThreshold) visibleCount++;
-  }
-
-  // Cap the number of rendered splats. SHARP outputs ~1M gaussians; on the
-  // discrete GPU 500k renders smoothly. Stride-sampling keeps a representative
-  // subset so the subject stays dense.
-  // Cap splats so the cloud renders without crashing the WebGL context on the
-  // integrated GPU. With the discrete GPU (powerPreference + Windows GPU
-  // preference), all splats render; lower this only if the iGPU is still in use.
-  const MAX_SPLATS = Infinity;
-  const strideSample = visibleCount > MAX_SPLATS ? Math.ceil(visibleCount / MAX_SPLATS) : 1;
-  const renderCount = Math.ceil(visibleCount / strideSample);
-
-  const positions = new Float32Array(renderCount * 3);
-  const colors = new Float32Array(renderCount * 3);
-  const alphaAttr = new Float32Array(renderCount);
-  // Per-splat 3D covariance (xx,yy,zz,xy in covA; xz,yz in covB) for true
-  // gaussian-splat rendering: each splat becomes an elliptical billboard sized
-  // by its scale+rotation, not a uniform round point.
-  const covA = new Float32Array(renderCount * 4);
-  const covB = new Float32Array(renderCount * 2);
-  let out = 0;
-  let visibleSeen = 0;
-
-  for (let i = 0; i < vertexCount; i++) {
-    if (alphas[i] <= alphaThreshold) continue;
-    // Keep every strideSample-th visible splat to respect the cap.
-    if (visibleSeen % strideSample !== 0) {
-      visibleSeen++;
-      continue;
-    }
-    visibleSeen++;
-    const base = i * stride;
-    // SHARP writes OpenCV camera coords (x-right, y-down, z-forward). Three.js
-    // expects y-up. The user wants the view flipped horizontally 180deg and
-    // rotated 180deg, which combined is y->-y, z->-z. Apply it here so the
-    // framing/orbit math works on corrected coordinates.
-    positions[out * 3] = view.getFloat32(base + propIndex["x"] * 4, littleEndian);
-    positions[out * 3 + 1] = -view.getFloat32(base + propIndex["y"] * 4, littleEndian);
-    positions[out * 3 + 2] = -view.getFloat32(base + propIndex["z"] * 4, littleEndian);
-
-    // SH DC -> linear RGB: 0.5 + SH_C0 * f_dc
-    const r = 0.5 + SH_C0 * view.getFloat32(base + propIndex["f_dc_0"] * 4, littleEndian);
-    const g = 0.5 + SH_C0 * view.getFloat32(base + propIndex["f_dc_1"] * 4, littleEndian);
-    const b = 0.5 + SH_C0 * view.getFloat32(base + propIndex["f_dc_2"] * 4, littleEndian);
-    const alpha = alphas[i];
-    alphaAttr[out] = alpha;
-    // Keep full color; opacity is applied in the fragment shader via vAlpha.
-    colors[out * 3] = clamp01(r);
-    colors[out * 3 + 1] = clamp01(g);
-    colors[out * 3 + 2] = clamp01(b);
-
-    // 3D covariance = R * diag(s0^2,s1^2,s2^2) * R^T from scale (exp) and
-    // rotation quaternion (w,x,y,z). Normalize the quaternion first — SHARP
-    // doesn't guarantee unit quaternions.
-    const s0 = Math.exp(view.getFloat32(base + propIndex["scale_0"] * 4, littleEndian));
-    const s1 = Math.exp(view.getFloat32(base + propIndex["scale_1"] * 4, littleEndian));
-    const s2 = Math.exp(view.getFloat32(base + propIndex["scale_2"] * 4, littleEndian));
-    let qw = view.getFloat32(base + propIndex["rot_0"] * 4, littleEndian);
-    let qx = view.getFloat32(base + propIndex["rot_1"] * 4, littleEndian);
-    let qy = view.getFloat32(base + propIndex["rot_2"] * 4, littleEndian);
-    let qz = view.getFloat32(base + propIndex["rot_3"] * 4, littleEndian);
-    const qn = Math.hypot(qw, qx, qy, qz) || 1.0;
-    qw /= qn; qx /= qn; qy /= qn; qz /= qn;
-    const r00 = 1 - 2 * (qy * qy + qz * qz);
-    const r01 = 2 * (qx * qy - qz * qw);
-    const r02 = 2 * (qx * qz + qy * qw);
-    const r11 = 1 - 2 * (qx * qx + qz * qz);
-    const r12 = 2 * (qy * qz - qx * qw);
-    const r22 = 1 - 2 * (qx * qx + qy * qy);
-    const s0s0 = s0 * s0, s1s1 = s1 * s1, s2s2 = s2 * s2;
-    covA[out * 4] = r00 * r00 * s0s0 + r01 * r01 * s1s1 + r02 * r02 * s2s2;       // xx
-    covA[out * 4 + 1] = r11 * r11 * s1s1 + r01 * r01 * s0s0 + r12 * r12 * s2s2;   // yy
-    covA[out * 4 + 2] = r22 * r22 * s2s2 + r02 * r02 * s0s0 + r12 * r12 * s1s1;   // zz
-    covA[out * 4 + 3] = r00 * r01 * s0s0 + r01 * r11 * s1s1 + r02 * r12 * s2s2;   // xy
-    covB[out * 2] = r00 * r02 * s0s0 + r01 * r12 * s1s1 + r02 * r22 * s2s2;       // xz
-    covB[out * 2 + 1] = r11 * r12 * s1s1 + r01 * r02 * s0s0 + r12 * r22 * s2s2;   // yz
-    out++;
-  }
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-  geometry.setAttribute("alpha", new THREE.BufferAttribute(alphaAttr, 1));
-  geometry.setAttribute("cov3dA", new THREE.BufferAttribute(covA, 4));
-  geometry.setAttribute("cov3dB", new THREE.BufferAttribute(covB, 2));
-  geometry.userData.is3dgs = true;
-  geometry.userData.splatCount = renderCount;
-  return geometry;
-}
-
-function clamp01(v) {
-  return v < 0 ? 0 : v > 1 ? 1 : v;
-}
-
-// Frame a loaded GaussianSplats3D scene: center it at the origin and set the
-// camera distance so the bounding box fills the view.
-function frameSplatBox(box) {
-  const center = box.getCenter(new THREE.Vector3());
-  const size = box.getSize(new THREE.Vector3());
-  const maxDim = Math.max(size.x, size.y, size.z) || 1;
-  // Re-center the splat group at the origin for orbiting.
-  if (state.currentMesh) {
-    state.currentMesh.position.sub(center);
-  }
-  const fov = state.camera.fov * Math.PI / 180;
-  const aspect = state.camera.aspect || 1;
-  const distForH = size.y / (2 * Math.tan(fov / 2));
-  const distForW = size.x / (2 * Math.tan(fov / 2) * aspect);
-  const fitDist = Math.max(distForH, distForW) * 1.2;
-  state.camera.position.set(0, 0, fitDist);
-  state.camera.near = Math.max(fitDist * 0.001, 0.1);
-  state.camera.far = Math.max(fitDist, size.z) * 50 + 1000;
-  state.camera.updateProjectionMatrix();
-  state.controls.target.set(0, 0, 0);
-  state.controls.update();
-  showViewerOverlay(
-    `3DGS · ${Math.round(size.x * 100) / 100} × ${Math.round(size.y * 100) / 100} × ${Math.round(size.z * 100) / 100}`
-  );
-}
-
-// True gaussian-splat material: each splat is a screen-space elliptical
-// billboard whose size/shape comes from the projected 3D covariance (scale +
-// rotation), with a gaussian alpha falloff so overlapping splats blend into a
-// continuous smooth surface. This is real 3DGS rendering, not a point cloud.
-function createSplatMaterial() {
-  return new THREE.ShaderMaterial({
-    transparent: true,
-    depthWrite: false,
-    depthTest: false,
-    blending: THREE.NormalBlending,
-    uniforms: {
-      viewport: { value: new THREE.Vector2(1, 1) },
-    },
-    vertexShader: /* glsl */ `
-      attribute vec3 color;
-      attribute float alpha;
-      attribute vec4 cov3dA;   // xx, yy, zz, xy
-      attribute vec2 cov3dB;   // xz, yz
-      uniform vec2 viewport;
-      varying vec3 vColor;
-      varying float vAlpha;
-      varying vec2 vCov2D;     // (a, c) diagonal
-      varying float vCov2D_b;  // off-diagonal
-      varying float vRadius;
-      void main() {
-        vColor = color;
-        vAlpha = alpha;
-        vec4 mv = modelViewMatrix * vec4(position, 1.0);
-        gl_Position = projectionMatrix * mv;
-
-        float z = -mv.z;
-        if (z <= 0.0001) {
-          gl_PointSize = 0.0;
-          return;
-        }
-
-        float sxx = cov3dA.x, syy = cov3dA.y, szz = cov3dA.z;
-        float sxy = cov3dA.w, sxz = cov3dB.x, syz = cov3dB.y;
-        sxx = clamp(sxx, 0.0, 4.0);
-        syy = clamp(syy, 0.0, 4.0);
-        szz = clamp(szz, 0.0, 4.0);
-
-        // Project covariance to screen space using the viewport so the result
-        // is in pixel units (gl_PointSize is pixels).
-        float fx = projectionMatrix[0][0] * viewport.x * 0.5;
-        float fy = projectionMatrix[1][1] * viewport.y * 0.5;
-        float j0 = fx / z, j2 = -fx * mv.x / (z * z);
-        float k1 = fy / z, k2 = -fy * mv.y / (z * z);
-        float a = j0 * (j0 * sxx + j2 * sxz) + j2 * (j0 * sxz + j2 * szz);
-        float b = k1 * (j0 * sxy + j2 * syz) + k2 * (j0 * sxz + j2 * szz);
-        float c = k1 * (k1 * syy + k2 * syz) + k2 * (k1 * syz + k2 * szz);
-        a += 0.3;
-        c += 0.3;
-
-        float mid = 0.5 * (a + c);
-        float disc = sqrt(max(0.25 * (a - c) * (a - c) + b * b, 0.0));
-        float lambdaMax = max(mid + disc, 0.01);
-        float radius = 3.0 * sqrt(lambdaMax);
-        radius = clamp(radius, 1.5, 96.0);
-
-        vCov2D = vec2(a, c);
-        vCov2D_b = b;
-        vRadius = radius;
-        gl_PointSize = radius * 2.0;
-      }
-    `,
-    fragmentShader: /* glsl */ `
-      precision highp float;
-      varying vec3 vColor;
-      varying float vAlpha;
-      varying vec2 vCov2D;
-      varying float vCov2D_b;
-      varying float vRadius;
-      void main() {
-        // Convert gl_PointCoord to a pixel-space offset from the splat center.
-        vec2 d = (gl_PointCoord * 2.0 - 1.0) * vRadius;
-        float a = vCov2D.x, b = vCov2D_b, c = vCov2D.y;
-        float det = a * c - b * b;
-        if (det <= 0.0) discard;
-        float m2 = (c * d.x * d.x - 2.0 * b * d.x * d.y + a * d.y * d.y) / det;
-        float alpha = vAlpha * exp(-0.5 * m2);
-        if (alpha < 0.01) discard;
-        gl_FragColor = vec4(vColor, alpha);
-      }
-    `,
-  });
-}
-
-// Compute a bounding box of the cloud's dense core, ignoring outlier points.
-// SHARP scenes are often elongated (e.g. a 400-unit z trail) with a dense
-// subject in a small fraction of that span. The full bbox would leave the
-// subject as a dot, so we use the interquartile range (25-75th percentile)
-// as the subject extent and frame around that.
-function computeRobustFrame(geometry) {
-  const pos = geometry.attributes.position;
-  const count = pos.count;
-  const sample = Math.min(count, 50000);
-  const step = Math.max(1, Math.floor(count / sample));
-  const xs = [], ys = [], zs = [];
-  for (let i = 0; i < count; i += step) {
-    xs.push(pos.getX(i));
-    ys.push(pos.getY(i));
-    zs.push(pos.getZ(i));
-  }
-  xs.sort((a, b) => a - b);
-  ys.sort((a, b) => a - b);
-  zs.sort((a, b) => a - b);
-  const lo = (arr) => arr[Math.floor(arr.length * 0.25)];
-  const hi = (arr) => arr[Math.floor(arr.length * 0.75)];
-  const minX = lo(xs), maxX = hi(xs);
-  const minY = lo(ys), maxY = hi(ys);
-  const minZ = lo(zs), maxZ = hi(zs);
-  const center = new THREE.Vector3(
-    (minX + maxX) / 2,
-    (minY + maxY) / 2,
-    (minZ + maxZ) / 2
-  );
-  // Inflate the IQR span by 2x so we frame the subject, not just its middle
-  // quartile (IQR covers 50% of points; 2x covers most of the subject).
-  const size = new THREE.Vector3(
-    Math.max((maxX - minX) * 2, 0.1),
-    Math.max((maxY - minY) * 2, 0.1),
-    Math.max((maxZ - minZ) * 2, 0.1)
-  );
-  return { center, size };
-}
-
-async function loadPly(path) {
-  showViewerOverlay("Loading PLY…");
-  try {
-    const response = await fetch(`/api/file?path=${encodeURIComponent(path)}`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const buffer = await response.arrayBuffer();
-    // buildGeometryFromPly handles binary 3DGS PLYs (SHARP output); everything
-    // else (ASCII, mesh PLYs) falls back to Three.js's PLYLoader.
-    disposeCurrentMesh();
-
-    const is3dgsBinary = (function () {
-      // Quick header sniff: 3DGS PLYs have f_dc_* properties. We only need to
-      // know whether to route to GaussianSplats3D (URL-based) vs our parser.
-      const bytes = new Uint8Array(buffer);
-      const head = new TextDecoder("ascii").decode(bytes.slice(0, 2048));
-      return head.includes("f_dc_0") && head.includes("end_header");
-    })();
-
-    let geometry = null;
-    let frame = null;
-    if (!is3dgsBinary) {
-      geometry = buildGeometryFromPly(buffer);
-      if (geometry === null) {
-        const loader = new PLYLoader();
-        geometry = loader.parse(buffer);
-      }
-      frame = computeRobustFrame(geometry);
-    }
-
-    // 3DGS PLYs render through GaussianSplats3D (DropInViewer): a mature
-    // renderer with proper splat sorting, alpha blending, and EWA projection.
-    // Non-3DGS PLYs fall back to our Three.js point/mesh rendering.
-    const is3dgs = is3dgsBinary;
-    const hasIndex = geometry ? geometry.index !== null : false;
-    const maxDim = frame ? Math.max(frame.size.x, frame.size.y, frame.size.z) || 1 : 10;
-
-    if (is3dgs) {
-      // GaussianSplats3D Viewer in self-driven mode: it manages its own render
-      // loop, controls, and renderer on the canvas element. This is the
-      // documented simple path and avoids the integration stalls that happen
-      // when handing it an external renderer.
-      const canvas = $("viewerCanvas");
-      const wrap = canvas.parentElement;
-      const gsViewer = new Viewer({
-        selfDrivenMode: true,
-        useBuiltInControls: true,
-        sharedMemoryForWorkers: false,
-        gpuAcceleratedSort: false,
-        splatAlphaRemovalThreshold: 5,
-        rootElement: wrap,
-        cameraUp: [0, 1, 0],
-      });
-      state.currentMesh = gsViewer;
-      state.gsViewer = gsViewer;
-      window.__gsViewer = gsViewer; // debug hook
-      showViewerOverlay("Loading 3DGS via GaussianSplats3D…");
-      try {
-        await gsViewer.addSplatScene(`/api/ply-vertex-only?path=${encodeURIComponent(path)}`, {
-          showLoadingUI: false,
-        });
-        // Start the self-driven render loop (sorting + drawing) now that the
-        // splat scene is loaded.
-        gsViewer.start();
-        showViewerOverlay("3DGS loaded");
-      } catch (err) {
-        showViewerOverlay("Failed to load 3DGS");
-        showError(err.message || String(err));
-      }
-      return;
-    }
-
-    let mesh;
-    if (hasIndex) {
-      mesh = new THREE.Mesh(
-        geometry,
-        new THREE.MeshStandardMaterial({
-          color: 0x0f766e,
-          vertexColors: geometry.attributes.color !== undefined,
-          side: THREE.DoubleSide,
-          flatShading: true,
-        })
-      );
-    } else {
-      const pointSize = Math.max(maxDim * 0.003, 0.005);
-      mesh = new THREE.Points(
-        geometry,
-        new THREE.PointsMaterial({
-          size: pointSize,
-          vertexColors: geometry.attributes.color !== undefined,
-          color: geometry.attributes.color !== undefined ? 0xffffff : 0x0f766e,
-          sizeAttenuation: true,
-          transparent: false,
-          depthWrite: true,
-        })
-      );
-    }
-
-    const { center, size } = frame;
-    // Re-center the subject at the origin so OrbitControls rotates around it.
-    mesh.position.sub(center);
-    state.scene.add(mesh);
-    state.currentMesh = mesh;
-
-    // Frame the subject to fill the view. The camera looks down +z, so the
-    // visible extent is the x/y plane; distance is set to fit the larger of the
-    // two (accounting for aspect ratio), not the depth axis. For an elongated
-    // SHARP scene this keeps the subject large instead of fitting the long z
-    // tail into a tiny view.
-    const fov = state.camera.fov * Math.PI / 180;
-    const aspect = state.camera.aspect || 1;
-    // Fit the larger screen dimension: if aspect > 1 (wide), y is the limit;
-    // otherwise x is. Use the max of x/y extent scaled to fill.
-    const visibleH = size.y;
-    const visibleW = size.x;
-    const distForH = visibleH / (2 * Math.tan(fov / 2));
-    const distForW = visibleW / (2 * Math.tan(fov / 2) * aspect);
-    const fitDist = Math.max(distForH, distForW) * 1.2;
-    state.camera.position.set(0, 0, fitDist);
-    // Wide near/far so the whole elongated scene stays visible when orbiting
-    // and zooming; SHARP scenes span a large z range.
-    state.camera.near = Math.max(fitDist * 0.001, 0.1);
-    state.camera.far = Math.max(fitDist, size.z) * 50 + 1000;
-    state.camera.updateProjectionMatrix();
-    state.controls.target.set(0, 0, 0);
-    state.controls.update();
-    requestRender();
-
-    const kind = is3dgs ? "3DGS" : hasIndex ? "mesh" : "points";
-    showViewerOverlay(
-      `${kind} · ${geometry.attributes.position.count} pts · ${Math.round(size.x * 100) / 100} × ${Math.round(size.y * 100) / 100} × ${Math.round(size.z * 100) / 100}`
-    );
-  } catch (err) {
-    showViewerOverlay("Failed to load PLY");
-    showError(err.message || String(err));
-  }
-}
-
-function showViewerOverlay(text) {
-  $("viewerOverlay").textContent = text;
-}
 
 // ---------------------------------------------------------------------------
 // API helpers
@@ -647,55 +65,489 @@ async function api(path, options = {}) {
   return data;
 }
 
-async function refreshPlyFiles() {
-  const data = await api("/api/ply-files");
-  const sel = $("plySelect");
-  sel.innerHTML = data.files
-    .map((file) => `<option value="${file.path}">${file.name}</option>`)
-    .join("");
-  if (data.files.length) {
-    await loadPly(data.files[0].path);
+// ---------------------------------------------------------------------------
+// UI helpers
+// ---------------------------------------------------------------------------
+function showError(msg) {
+  const el = $("errorToast");
+  el.textContent = msg;
+  el.classList.add("visible");
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => el.classList.remove("visible"), 5000);
+}
+
+function setBusy(show, text) {
+  const overlay = $("busyOverlay");
+  if (text) $("busyText").textContent = text;
+  overlay.classList.toggle("visible", show);
+}
+
+function showModeBadge(text) {
+  const badge = $("modeBadge");
+  badge.textContent = text;
+  badge.classList.toggle("visible", !!text);
+  clearTimeout(badge._timer);
+  if (text) {
+    badge._timer = setTimeout(() => badge.classList.remove("visible"), 2000);
+  }
+}
+
+function showViewHint(show) {
+  $("viewHint").classList.toggle("visible", show);
+}
+
+// ---------------------------------------------------------------------------
+// Frame: constrains 3D canvas & preview image to uploaded photo aspect ratio.
+// Acts like a “window” — splat rendering is clipped, no overflow on rotate.
+// ---------------------------------------------------------------------------
+function updateFrameSize() {
+  if (!state.photoWidth || !state.photoHeight) return;
+  const previewEl = $("preview");
+  const pw = previewEl.clientWidth;
+  const ph = previewEl.clientHeight;
+  if (!pw || !ph) return;
+
+  const photoRatio = state.photoWidth / state.photoHeight;
+  const screenRatio = pw / ph;
+
+  let frameW, frameH;
+  if (photoRatio > screenRatio) {
+    // Photo is wider — fit to width.
+    frameW = pw;
+    frameH = pw / photoRatio;
   } else {
-    showViewerOverlay("No .ply files in inputs/");
+    // Photo is taller — fit to height.
+    frameH = ph;
+    frameW = ph * photoRatio;
+  }
+
+  const frame = $("frame");
+  frame.style.width = frameW + "px";
+  frame.style.height = frameH + "px";
+
+  // Update camera aspect ratio so 3D content isn't stretched.
+  if (state.viewer && state.viewer.camera) {
+    state.viewer.camera.aspect = frameW / frameH;
+    state.viewer.camera.updateProjectionMatrix();
   }
 }
 
 // ---------------------------------------------------------------------------
-// Screenshot + repair
+// Photo upload
 // ---------------------------------------------------------------------------
-async function captureAndRepair() {
-  if (!state.currentMesh) {
-    showError("Load a PLY first, then capture a view.");
+function onPhotoSelected(file) {
+  if (!file) return;
+  state.photoName = file.name;
+  state.plyPath = null;
+  state.plyUrl = null;
+  state.screenshotUrl = null;
+  state.repairUrl = null;
+  state.comparing = false;
+  state.inRepairView = false;
+
+  // Dispose previous viewer if any (fire-and-forget; loadSplatPreview awaits it).
+  disposeViewer();
+  // Deactivate 3D canvas container (show photo instead).
+  $("canvasContainer").classList.remove("active");
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    state.photoDataUrl = reader.result;
+
+    // Save original photo dimensions for frame aspect ratio.
+    const tmpImg = new Image();
+    tmpImg.onload = () => {
+      state.photoWidth = tmpImg.naturalWidth;
+      state.photoHeight = tmpImg.naturalHeight;
+      updateFrameSize();
+    };
+    tmpImg.src = reader.result;
+
+    // Show frame + uploaded photo.
+    $("frame").classList.add("active");
+    const img = $("previewImg");
+    img.src = reader.result;
+    img.classList.add("visible");
+
+    // Hide upload prompt, show generate button.
+    $("uploadPrompt").classList.add("hidden");
+    $("generateBtn").classList.remove("hidden");
+    $("generateBtn").disabled = false;
+
+    // Hide post-generate buttons and repair button.
+    $("postGroup").classList.add("hidden");
+    $("repairBtn").classList.add("hidden");
+    showModeBadge("");
+    showViewHint(false);
+  };
+  reader.readAsDataURL(file);
+}
+
+// ---------------------------------------------------------------------------
+// Generate: SHARP predict (photo → PLY) → load 3D preview
+// ---------------------------------------------------------------------------
+async function generate() {
+  if (!state.photoDataUrl) {
+    showError("请先上传一张照片");
     return;
   }
-  hideError();
-  setBusy(true);
 
-  // Render immediately before reading the buffer so the screenshot reflects the
-  // exact current camera angle.
-  state.renderer.render(state.scene, state.camera);
-  const screenshot = state.renderer.domElement.toDataURL("image/png");
+  $("generateBtn").disabled = true;
 
-  const payload = {
-    screenshot,
-    prompt: $("prompt").value,
-    steps: Number($("steps").value) || 4,
-    megapixels: Number($("megapixels").value) || 1,
+  try {
+    // ── Stage 1: SHARP — photo → 3DGS .ply ──
+    setBusy(true, "正在生成 3D 模型…");
+    const sharpData = await api("/api/sharp/generate", {
+      method: "POST",
+      body: JSON.stringify({
+        imageData: state.photoDataUrl,
+        imageName: state.photoName,
+      }),
+    });
+
+    // Poll SHARP status until done.
+    const plyPath = await pollSharpDone(sharpData.job_id);
+    state.plyPath = plyPath;
+
+    // Build PLY URL (use vertex-only endpoint for GaussianSplats3D compat).
+    const plyUrl = `/api/ply-vertex-only?path=${encodeURIComponent(plyPath)}`;
+    state.plyUrl = plyUrl;
+
+    // ── Stage 2: Load PLY into 3D viewer ──
+    // Hide our busy overlay — GaussianSplats3D shows its own loading spinner
+    // inside the canvas container, which gives better progress feedback.
+    setBusy(false);
+    try {
+      await loadSplatPreview(plyUrl);
+    } catch (loadErr) {
+      console.error("[generate] 3D preview load failed:", loadErr);
+      throw new Error("3D 预览加载失败: " + (loadErr.message || String(loadErr)));
+    }
+
+    // Transition to 3D preview mode.
+    $("generateBtn").classList.add("hidden");
+    $("repairBtn").classList.remove("hidden");
+    showViewHint(true);
+  } catch (err) {
+    setBusy(false);
+    showError(err.message || String(err));
+    $("generateBtn").disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 3D Splat Preview (GaussianSplats3D)
+// ---------------------------------------------------------------------------
+async function loadSplatPreview(plyUrl) {
+  // Wait for any pending disposal from onPhotoSelected.
+  if (state.disposePromise) {
+    await state.disposePromise;
+    state.disposePromise = null;
+  }
+
+  const container = $("canvasContainer");
+
+  console.log("[loadSplatPreview] Creating viewer, PLY URL:", plyUrl);
+
+  // Create GaussianSplats3D viewer.
+  // - It creates its own renderer (with preserveDrawingBuffer: true),
+  //   camera, and OrbitControls internally.
+  // - Canvas is appended to rootElement (canvasContainer).
+  const viewer = new Viewer({
+    rootElement: container,
+    cameraUp: [0, -1, 0], // Flip Y-up to fix inverted model from SHARP
+    initialCameraPosition: [0, 0, -1.5],
+    initialCameraLookAt: [0, 0, 0],
+    sceneRevealMode: 2, // SceneRevealMode.Instant — show immediately
+    // SharedArrayBuffer requires Cross-Origin-Isolation headers which our
+    // simple HTTP server doesn't set. Disable to avoid DataCloneError.
+    sharedMemoryForWorkers: false,
+  });
+
+  state.viewer = viewer;
+
+  // Activate canvas container BEFORE loading so GaussianSplats3D's
+  // built-in loading spinner and progress bar are visible to the user.
+  container.classList.add("active");
+  $("previewImg").classList.remove("visible");
+
+  // Load the PLY file.
+  // NOTE: Must pass format explicitly because the URL (/api/ply-vertex-only?path=...)
+  // doesn't end with .ply, so GaussianSplats3D can't auto-detect the format.
+  console.log("[loadSplatPreview] Loading splat scene...");
+  try {
+    await viewer.addSplatScene(plyUrl, { format: SceneFormat.Ply });
+  } catch (loadErr) {
+    // Loading failed — deactivate canvas so user sees the photo again.
+    container.classList.remove("active");
+    $("previewImg").classList.add("visible");
+    throw loadErr;
+  }
+  console.log("[loadSplatPreview] Splat scene loaded, starting render loop.");
+
+  // Start the self-driven render loop.
+  viewer.start();
+
+  // ── Auto-fit camera to model bounding box ──
+  // Position the camera so the model fills the frame similarly to the
+  // original photo, fixing the "too far / wrong angle" issue.
+  const splatMesh = viewer.splatMesh;
+  if (splatMesh && splatMesh.getSplatCount() > 0) {
+    const bbox = splatMesh.computeBoundingBox(true);
+    const center = new THREE.Vector3();
+    bbox.getCenter(center);
+    const size = new THREE.Vector3();
+    bbox.getSize(size);
+
+    // Use height-based framing for portrait photos.
+    // The subject (person) typically occupies most of the vertical space.
+    const camera = viewer.camera;
+    const fovRad = (camera.fov * Math.PI) / 180;
+    // Match the model height to fill ~190% of the frame vertically (zoomed in).
+    const padding = 1.9;
+    const dist = (size.y / 2) / Math.tan(fovRad / 2) / padding;
+
+    // Position camera in front of the model center, looking at center.
+    // SHARP outputs Y-down; original camera looks from -Z towards +Z.
+    camera.position.set(center.x, center.y, center.z - dist);
+    camera.lookAt(center);
+    camera.updateProjectionMatrix();
+
+    // Update OrbitControls target so rotation orbits around the model center.
+    if (viewer.controls && viewer.controls.target) {
+      viewer.controls.target.copy(center);
+      viewer.controls.update();
+    }
+
+    console.log(`[loadSplatPreview] Auto-fit camera: center=(${center.x.toFixed(2)}, ${center.y.toFixed(2)}, ${center.z.toFixed(2)}), size=(${size.x.toFixed(2)}, ${size.y.toFixed(2)}, ${size.z.toFixed(2)}), dist=${dist.toFixed(2)}`);
+  }
+
+  // Attach real-time edge feathering post-processing.
+  setupSplatPostProcessing(viewer);
+
+  // Update camera aspect ratio to match the frame.
+  updateFrameSize();
+}
+
+// ---------------------------------------------------------------------------
+// Real-time splat edge feathering post-processing.
+// Monkey-patches viewer.render() to:
+//   1. Render splats to an offscreen render target
+//   2. Run a GPU shader that does alpha-based edge dilation + Gaussian blur
+//      for smooth feathered splat boundaries (no hard edges).
+// ---------------------------------------------------------------------------
+function setupSplatPostProcessing(viewer) {
+  const renderer = viewer.renderer;
+
+  // ── Offscreen render target for splat scene ──
+  const rtSize = new THREE.Vector2();
+  renderer.getDrawingBufferSize(rtSize);
+
+  const splatRT = new THREE.WebGLRenderTarget(rtSize.x, rtSize.y, {
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    format: THREE.RGBAFormat,
+    type: THREE.UnsignedByteType,
+  });
+
+  // ── Fullscreen quad + edge-feathering shader ──
+  const postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+  const postMaterial = new THREE.ShaderMaterial({
+    uniforms: {
+      tSplat:       { value: splatRT.texture },
+      uResolution:  { value: new THREE.Vector2(rtSize.x, rtSize.y) },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = vec4(position.xy, 0.0, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      precision highp float;
+      uniform sampler2D tSplat;
+      uniform vec2 uResolution;
+      varying vec2 vUv;
+
+      void main() {
+        vec2 texel = 1.0 / uResolution;
+        vec4 center = texture2D(tSplat, vUv);
+
+        // ── Alpha-weighted colour dilation (5×5) ──
+        // Propagate splat edge colour into nearby holes for gap-filling.
+        vec3 dilatedCol = center.rgb * max(center.a, 0.001);
+        float dilatedW  = max(center.a, 0.001);
+
+        for (int dy = -2; dy <= 2; dy++) {
+          for (int dx = -2; dx <= 2; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            vec2 off = vec2(float(dx), float(dy)) * texel;
+            vec4 s = texture2D(tSplat, vUv + off);
+            float d = length(vec2(float(dx), float(dy)));
+            float w = s.a * max(0.0, 1.0 - d * 0.28);
+            dilatedCol += s.rgb * w;
+            dilatedW  += w;
+          }
+        }
+        dilatedCol /= max(dilatedW, 0.001);
+
+        // ── Edge-aware Gaussian blur (7×7, sigma=2.5) ──
+        // Only active near splat boundaries for feathering.
+        float edgeMask = smoothstep(0.15, 0.75, center.a)
+                       * (1.0 - smoothstep(0.75, 0.98, center.a));
+
+        vec3 blurred = dilatedCol;
+        float bW = 1.0;
+        float sigma = 2.5;
+        for (int dy = -3; dy <= 3; dy++) {
+          for (int dx = -3; dx <= 3; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            vec2 off = vec2(float(dx), float(dy)) * texel;
+            vec4 s = texture2D(tSplat, vUv + off);
+            float d2 = float(dx*dx + dy*dy);
+            float g = exp(-d2 / (2.0 * sigma * sigma));
+            blurred += s.rgb * g;
+            bW += g;
+          }
+        }
+        blurred /= bW;
+
+        // Interior keeps original colour; edges get feathered fill.
+        vec3 rgb = mix(dilatedCol, blurred, edgeMask * 0.7);
+
+        // Smooth the alpha at splat boundaries for a soft edge.
+        float alpha = smoothstep(0.0, 0.12, center.a);
+
+        gl_FragColor = vec4(rgb, alpha);
+      }
+    `,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+  });
+
+  const postQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), postMaterial);
+  const postScene = new THREE.Scene();
+  postScene.add(postQuad);
+
+  // ── Patch viewer.render() ──
+  const originalRender = viewer.render.bind(viewer);
+  viewer.render = function () {
+    const savedAutoClear = renderer.autoClear;
+
+    // Resize render target if canvas size changed.
+    const curSize = new THREE.Vector2();
+    renderer.getDrawingBufferSize(curSize);
+    if (curSize.x !== splatRT.width || curSize.y !== splatRT.height) {
+      splatRT.setSize(curSize.x, curSize.y);
+      postMaterial.uniforms.uResolution.value.set(curSize.x, curSize.y);
+    }
+
+    // 1. Render splat scene to offscreen target.
+    renderer.setRenderTarget(splatRT);
+    renderer.autoClear = true;
+    originalRender();
+
+    // 2. Edge-feathering pass → screen.
+    renderer.setRenderTarget(null);
+    renderer.autoClear = true;
+    renderer.render(postScene, postCamera);
+
+    renderer.autoClear = savedAutoClear;
   };
-  const seed = Number($("seed").value);
-  if (Number.isFinite(seed) && seed > 0) {
-    payload.seed = Math.floor(seed);
+}
+
+function disposeViewer() {
+  if (state.viewer) {
+    const v = state.viewer;
+    state.viewer = null;
+    state.disposePromise = v.dispose().catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Screenshot: capture current 3D view as data URL
+// Captures at original photo resolution for consistent size with input.
+// ---------------------------------------------------------------------------
+function captureScreenshot() {
+  const viewer = state.viewer;
+  if (!viewer || !viewer.renderer) {
+    throw new Error("3D 预览未就绪");
+  }
+
+  return new Promise((resolve, reject) => {
+    // Force a render so the canvas has the latest frame, then capture.
+    requestAnimationFrame(() => {
+      try {
+        const canvas = viewer.renderer.domElement;
+
+        // Capture at canvas resolution — the canvas is sized to match
+        // the frame, which already has the photo's aspect ratio.
+        const offscreenCanvas = document.createElement('canvas');
+        offscreenCanvas.width = canvas.width;
+        offscreenCanvas.height = canvas.height;
+        const ctx = offscreenCanvas.getContext('2d');
+        ctx.drawImage(canvas, 0, 0);
+
+        resolve(offscreenCanvas.toDataURL("image/png"));
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Repair: screenshot current view → send to ComfyUI
+// ---------------------------------------------------------------------------
+async function repair() {
+  if (!state.viewer) {
+    showError("3D 预览未就绪");
+    return;
   }
 
   try {
-    const data = await api("/api/repair-screenshot", {
+    // Capture screenshot of current 3D view.
+    setBusy(true, "正在截取画面…");
+    const screenshotDataUrl = await captureScreenshot();
+
+    // Send to ComfyUI for repair.
+    setBusy(true, "正在修复图像…");
+    const repairData = await api("/api/repair-screenshot", {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        screenshot: screenshotDataUrl,
+        prompt: REPAIR_PROMPT,
+        steps: 4,
+        megapixels: 1,
+        ply_path: state.plyPath,
+      }),
     });
-    $("screenshotImg").src = `${data.screenshot_url}&t=${Date.now()}`;
-    $("repairImg").src = `${data.repair_url}&t=${Date.now()}`;
-    $("outputSection").style.display = "grid";
-    $("outputMeta").textContent = `${data.repair_path}`;
+
+    state.screenshotUrl = repairData.screenshot_url;
+    state.repairUrl = repairData.repair_url;
+
+    // Hide 3D canvas — repair result is now showing.
+    $("canvasContainer").classList.remove("active");
+
+    // Show repair result inside the frame.
+    const img = $("previewImg");
+    img.src = `${state.repairUrl}&t=${Date.now()}`;
+    img.classList.add("visible");
+    state.inRepairView = true;
+
+    // Reset restore button text.
+    $("restoreBtn").textContent = "恢复3D";
+
+    // Switch buttons: hide repair, show compare + export.
+    $("repairBtn").classList.add("hidden");
+    showViewHint(false);
+    $("postGroup").classList.remove("hidden");
+    state.comparing = false;
+    showModeBadge("修复结果");
+    $("compareBtn").classList.remove("active");
   } catch (err) {
     showError(err.message || String(err));
   } finally {
@@ -703,128 +555,127 @@ async function captureAndRepair() {
   }
 }
 
-function setBusy(busy) {
-  const btn = $("captureBtn");
-  btn.disabled = busy;
-  btn.textContent = busy ? "补全中…" : "截图并补全";
-  $("spinner").classList.toggle("show", busy);
-}
-
-function showError(msg) {
-  const el = $("alert");
-  el.textContent = msg;
-  el.style.display = "block";
-}
-
-function hideError() {
-  $("alert").style.display = "none";
-}
-
 // ---------------------------------------------------------------------------
-// Photo upload -> SHARP predict -> load PLY
+// Compare: toggle between screenshot (原图) and repair result (修复结果)
 // ---------------------------------------------------------------------------
-const photoState = {
-  file: null,
-  dataUrl: null,
-  name: null,
-  jobId: null,
-  pollTimer: null,
-};
+function toggleCompare() {
+  if (!state.repairUrl) return;
 
-function readAsDataURL(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
+  state.comparing = !state.comparing;
+  const img = $("previewImg");
 
-async function onPhotoSelected(file) {
-  photoState.file = file;
-  photoState.name = file.name;
-  photoState.dataUrl = await readAsDataURL(file);
-  $("photoPreview").src = photoState.dataUrl;
-  $("photoPreview").style.display = "block";
-  $("generatePlyBtn").disabled = false;
-  hideSharpError();
-  $("sharpLog").style.display = "none";
-}
-
-async function generatePly() {
-  if (!photoState.dataUrl) return;
-  hideSharpError();
-  $("generatePlyBtn").disabled = true;
-  $("generatePlyBtn").textContent = "生成中…";
-  $("sharpSpinner").classList.add("show");
-  $("sharpLog").textContent = "";
-  $("sharpLog").style.display = "block";
-
-  try {
-    const data = await api("/api/sharp/generate", {
-      method: "POST",
-      body: JSON.stringify({ imageData: photoState.dataUrl, imageName: photoState.name }),
-    });
-    photoState.jobId = data.job_id;
-    pollSharpStatus();
-  } catch (err) {
-    showSharpError(err.message || String(err));
-    resetGenerateBtn();
+  if (state.comparing) {
+    // Show the original uploaded photo.
+    img.src = state.photoDataUrl || "";
+    showModeBadge("原图");
+    $("compareBtn").classList.add("active");
+  } else {
+    // Show repair result.
+    img.src = `${state.repairUrl}&t=${Date.now()}`;
+    showModeBadge("修复结果");
+    $("compareBtn").classList.remove("active");
   }
 }
 
-function pollSharpStatus() {
-  if (photoState.pollTimer) clearTimeout(photoState.pollTimer);
-  const tick = async () => {
-    try {
-      const status = await api(`/api/sharp/status?job_id=${encodeURIComponent(photoState.jobId)}`);
-      if (status.log) {
-        $("sharpLog").textContent = status.log.slice(-4000);
-        $("sharpLog").scrollTop = $("sharpLog").scrollHeight;
-      }
-      if (status.state === "done" && status.ply_url) {
-        $("sharpSpinner").classList.remove("show");
-        resetGenerateBtn();
-        // Load the freshly generated PLY into the viewer and refresh the list.
-        await loadPly(status.ply_path);
-        await refreshPlyFiles();
-        return;
-      }
-      if (status.state === "failed") {
-        $("sharpSpinner").classList.remove("show");
-        resetGenerateBtn();
-        showSharpError(status.error || "sharp predict failed.");
-        return;
-      }
-      photoState.pollTimer = setTimeout(tick, 2000);
-    } catch (err) {
-      showSharpError(err.message || String(err));
-      $("sharpSpinner").classList.remove("show");
-      resetGenerateBtn();
-    }
-  };
-  tick();
+// ---------------------------------------------------------------------------
+// Restore 3D preview: show the canvas again with the same camera state as
+// when the user clicked "修复". The viewer is still in memory so the render
+// loop resumes automatically.
+// ---------------------------------------------------------------------------
+function restorePreview() {
+  if (!state.viewer) return;
+
+  // Show 3D canvas, hide preview image.
+  $("canvasContainer").classList.add("active");
+  $("previewImg").classList.remove("visible");
+
+  // Reset state flags.
+  state.comparing = false;
+  state.inRepairView = false;
+  showModeBadge("");
+  showViewHint(true);
+  $("compareBtn").classList.remove("active");
+
+  // Toggle button text so user can go back to repair result.
+  $("restoreBtn").textContent = "查看结果";
 }
 
-function resetGenerateBtn() {
-  $("generatePlyBtn").disabled = !photoState.dataUrl;
-  $("generatePlyBtn").textContent = "生成 PLY";
-}
+function showRepairResult() {
+  if (!state.repairUrl) return;
 
-function showSharpError(msg) {
-  const el = $("sharpAlert");
-  el.textContent = msg;
-  el.style.display = "block";
-}
+  // Hide 3D canvas, show repair image.
+  $("canvasContainer").classList.remove("active");
+  const img = $("previewImg");
+  img.src = `${state.repairUrl}&t=${Date.now()}`;
+  img.classList.add("visible");
+  state.inRepairView = true;
+  state.comparing = false;
+  showModeBadge("修复结果");
+  showViewHint(false);
+  $("compareBtn").classList.remove("active");
 
-function hideSharpError() {
-  $("sharpAlert").style.display = "none";
+  // Toggle button text back.
+  $("restoreBtn").textContent = "恢复3D";
 }
 
 // ---------------------------------------------------------------------------
-// ComfyUI status polling
+// Export: download the repair result image
 // ---------------------------------------------------------------------------
-async function refreshComfyuiStatus() {
+async function exportResult() {
+  if (!state.repairUrl) return;
+
+  try {
+    const response = await fetch(state.repairUrl);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `flux-sharp-repair-${Date.now()}.png`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    showError("导出失败: " + (err.message || String(err)));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Poll SHARP status until done or failed
+// ---------------------------------------------------------------------------
+function pollSharpDone(jobId) {
+  return new Promise((resolve, reject) => {
+    const tick = async () => {
+      try {
+        const status = await api(`/api/sharp/status?job_id=${encodeURIComponent(jobId)}`);
+        if (status.state === "done" && status.ply_path) {
+          resolve(status.ply_path);
+          return;
+        }
+        if (status.state === "failed") {
+          reject(new Error(status.error || "SHARP 生成失败"));
+          return;
+        }
+        setTimeout(tick, 2000);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    tick();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Status polling (API + ComfyUI health)
+// ---------------------------------------------------------------------------
+async function refreshStatus() {
+  try {
+    await api("/api/health");
+    $("healthDot").classList.toggle("ready", true);
+  } catch {
+    $("healthDot").classList.remove("ready");
+  }
+
   try {
     const data = await api("/api/comfyui-status");
     $("comfyuiDot").classList.toggle("ready", !!data.online);
@@ -836,34 +687,43 @@ async function refreshComfyuiStatus() {
 }
 
 // ---------------------------------------------------------------------------
-// Wire up the UI
+// Initialize
 // ---------------------------------------------------------------------------
 async function init() {
-  initViewer();
-  try {
-    await api("/api/health");
-    $("healthDot").classList.add("ready");
-  } catch {
-    $("healthDot").classList.remove("ready");
-  }
-
-  await refreshPlyFiles();
-  refreshComfyuiStatus();
-  setInterval(refreshComfyuiStatus, 15000);
-
-  $("plySelect").addEventListener("change", (e) => {
-    if (e.target.value) loadPly(e.target.value);
-  });
-  $("captureBtn").addEventListener("click", () => captureAndRepair().catch((err) => showError(err.message)));
-  $("randomSeedBtn").addEventListener("click", () => {
-    $("seed").value = Math.floor(Math.random() * 2 ** 31);
-  });
-
+  // Wire up events.
   $("photoInput").addEventListener("change", (e) => {
     const file = e.target.files[0];
-    if (file) onPhotoSelected(file).catch((err) => showSharpError(err.message));
+    if (file) onPhotoSelected(file);
   });
-  $("generatePlyBtn").addEventListener("click", () => generatePly().catch((err) => showSharpError(err.message)));
+
+  $("generateBtn").addEventListener("click", () => {
+    generate().catch((err) => showError(err.message));
+  });
+
+  $("repairBtn").addEventListener("click", () => {
+    repair().catch((err) => showError(err.message));
+  });
+
+  $("compareBtn").addEventListener("click", toggleCompare);
+
+  $("restoreBtn").addEventListener("click", () => {
+    if (state.inRepairView) {
+      restorePreview();
+    } else {
+      showRepairResult();
+    }
+  });
+
+  $("exportBtn").addEventListener("click", () => {
+    exportResult().catch((err) => showError(err.message));
+  });
+
+  // Window resize: update frame dimensions.
+  window.addEventListener("resize", updateFrameSize);
+
+  // Initial status check + polling.
+  await refreshStatus();
+  setInterval(refreshStatus, 15000);
 }
 
 init().catch((err) => showError(err.message || String(err)));

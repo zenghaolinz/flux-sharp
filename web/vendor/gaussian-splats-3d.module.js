@@ -12563,7 +12563,8 @@ class Viewer {
 
             this.renderer = new THREE.WebGLRenderer({
                 antialias: false,
-                precision: 'highp'
+                precision: 'highp',
+                preserveDrawingBuffer: true
             });
             this.renderer.setPixelRatio(this.devicePixelRatio);
             this.renderer.autoClear = true;

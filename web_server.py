@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,10 +22,44 @@ ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
 UPLOAD_ROOT = ROOT / "web_uploads"
 OUTPUT_ROOT = ROOT / "outputs"
+INPUT_ROOT = ROOT / "inputs"
 
 # Shared SharpRunner singleton: one background worker for sharp predict jobs.
-SHARP_RUNNER = SharpRunner(output_root=OUTPUT_ROOT)
+# Generated PLYs are copied into INPUT_ROOT so the PLY dropdown picks them up.
+SHARP_RUNNER = SharpRunner(output_root=OUTPUT_ROOT, inputs_root=INPUT_ROOT)
 COMFYUI_SERVER = "127.0.0.1:8188"
+MANIFEST_PATH = UPLOAD_ROOT / "manifest.json"
+_PLY_HASH_RE = re.compile(r"^(.+?)_([0-9a-f]{8})\.ply$")
+
+
+def _load_manifest() -> dict[str, str]:
+    """Load photo-base-name → PLY-relative-path manifest."""
+    if MANIFEST_PATH.exists():
+        return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    return {}
+
+
+def _save_manifest(manifest: dict[str, str]) -> None:
+    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+
+
+def _ply_base_name(ply_name: str) -> str:
+    """Extract base photo name from a PLY filename (strip trailing _{8hex})."""
+    m = _PLY_HASH_RE.match(ply_name)
+    return m.group(1) if m else Path(ply_name).stem
+
+
+def _find_cached_ply(image_name: str) -> Path | None:
+    """If a PLY already exists for this photo, return its absolute path."""
+    stem = Path(image_name).stem
+    manifest = _load_manifest()
+    rel = manifest.get(stem)
+    if rel:
+        abs_path = ROOT / rel
+        if abs_path.exists():
+            return abs_path
+    return None
 
 
 def _comfyui_online() -> bool:
@@ -53,7 +88,10 @@ def _safe_workspace_path(path: str | Path) -> Path:
 
 
 def _available_ply_files() -> list[dict[str, Any]]:
-    files = sorted((ROOT / "inputs").glob("*.ply"))
+    files = list((ROOT / "inputs").glob("*.ply"))
+    # Sort newest-first so a freshly generated PLY appears at the top and the
+    # front-end auto-loads it without extra logic.
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return [
         {
             "name": path.name,
@@ -291,7 +329,7 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
         screenshot_path.write_bytes(raw)
 
         repair_path = run_dir / "repair_output.png"
-        workflow_path = ROOT / "FLUX.2+Klein+4B.json"
+        workflow_path = ROOT / "FLUX.2+Klein+4B (1).json"
 
         client = ComfyUIClient(server="127.0.0.1:8188")
         client.run_flux2_klein_workflow(
@@ -318,15 +356,49 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
         # Accept an uploaded photo and queue a `sharp predict` job that turns it
         # into a 3DGS .ply. Returns immediately with a job_id; the front-end
         # polls /api/sharp/status.
+        image_data = payload.get("imageData")
+        if not image_data:
+            raise ValueError("Missing 'imageData' data URL in request body.")
+        image_name = payload.get("imageName") or "upload.png"
+
+        # ─ Cache hit: PLY already exists for this photo → skip SHARP. ──
+        cached_ply = _find_cached_ply(image_name)
+        if cached_ply:
+            job_id = uuid4().hex
+            # Register a completed fake job so pollSharpDone resolves immediately.
+            SHARP_RUNNER._jobs[job_id] = type(
+                "_CachedJob", (), {
+                    "job_id": job_id,
+                    "image_path": Path(image_name),
+                    "output_dir": OUTPUT_ROOT,
+                    "state": "done",
+                    "ply_path": cached_ply,
+                    "error": None,
+                    "log": "[cache] PLY already exists — skipped SHARP.",
+                    "_lock": __import__("threading").Lock(),
+                    "snapshot": lambda self: {
+                        "job_id": self.job_id, "state": self.state,
+                        "image_path": str(self.image_path),
+                        "ply_path": str(self.ply_path),
+                        "error": self.error, "log": self.log,
+                    },
+                }
+            )()
+            self._send_json({
+                "job_id": job_id,
+                "state": "done",
+                "ply_path": str(cached_ply),
+                "ply_url": f"/api/file?path={quote(str(cached_ply))}",
+                "cached": True,
+            })
+            return
+
+        # ─ Cache miss: run SHARP. ─
         if not SHARP_RUNNER.sharp_available():
             raise RuntimeError(
                 "sharp CLI not found. Install apple/ml-sharp into .venv-sharp "
                 "or put `sharp` on PATH."
             )
-        image_data = payload.get("imageData")
-        if not image_data:
-            raise ValueError("Missing 'imageData' data URL in request body.")
-        image_name = payload.get("imageName") or "upload.png"
 
         raw, mime_type = _decode_upload(image_data)
         suffix = _extension_for_mime(mime_type, image_name)
@@ -355,6 +427,17 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
         ply_path = status.get("ply_path")
         if ply_path:
             status["ply_url"] = f"/api/file?path={quote(str(ply_path))}"
+
+        # When a new PLY is generated, update the manifest so future uploads
+        # of the same photo can skip SHARP.
+        if status.get("state") == "done" and ply_path and not status.get("_cached"):
+            image_path_str = status.get("image_path", "")
+            if image_path_str:
+                base_name = _ply_base_name(Path(image_path_str).name)
+                manifest = _load_manifest()
+                manifest[base_name] = str(Path(ply_path).relative_to(ROOT))
+                _save_manifest(manifest)
+
         status["sharp_available"] = SHARP_RUNNER.sharp_available()
         self._send_json(status)
 

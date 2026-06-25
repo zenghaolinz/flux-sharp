@@ -3,135 +3,77 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Flux Sharp · PLY 预览 + 补全</title>
+    <title>Flux Sharp</title>
     <link rel="stylesheet" href="/web/style.css" />
-    <!--
-      PLYLoader / OrbitControls import from the bare specifier "three".
-      Map it to the vendored local module so the app works fully offline.
-    -->
     <script type="importmap">
-      {
-        "imports": {
-          "three": "/web/vendor/three.module.js",
-          "three/addons/": "/web/vendor/",
-          "@mkkellogg/gaussian-splats-3d": "/web/vendor/gaussian-splats-3d.module.js"
-        }
+    {
+      "imports": {
+        "three": "/web/vendor/three.module.js"
       }
+    }
     </script>
   </head>
   <body>
-    <main class="shell">
-      <aside class="panel">
-        <div class="brand">
-          <h1>Flux Sharp</h1>
-          <div class="status-dots">
-            <span class="status-pill"><span id="healthDot" class="status-dot" title="API status"></span>API</span>
-            <span class="status-pill"><span id="comfyuiDot" class="status-dot offline" title="ComfyUI status"></span>ComfyUI</span>
-          </div>
+    <!-- Full-screen preview area -->
+    <div class="preview" id="preview">
+
+      <!-- Frame: constrains 3D canvas & preview image to photo aspect ratio -->
+      <div class="frame" id="frame">
+        <!-- GaussianSplats3D mounts its canvas inside this container -->
+        <div class="canvas-container" id="canvasContainer">
         </div>
 
-        <section class="section">
-          <h2>照片转 PLY (SHARP)</h2>
-          <label class="drop" id="photoDrop">
-            <input id="photoInput" type="file" accept="image/png,image/jpeg,image/webp" />
-            <span>
-              <strong>上传照片</strong>
-              <span class="hint">SHARP 从单张照片回归 3D Gaussian Splat (.ply)</span>
-            </span>
-          </label>
-          <img id="photoPreview" class="upload-preview" alt="photo preview" />
-          <div class="buttons" style="grid-template-columns: 1fr; margin-top: 10px;">
-            <button id="generatePlyBtn" class="button" type="button" disabled>生成 PLY</button>
-          </div>
-          <div class="spinner" id="sharpSpinner" style="margin-top: 8px;">运行 sharp predict…</div>
-          <pre id="sharpLog" class="log-box"></pre>
-          <div class="alert" id="sharpAlert"></div>
-        </section>
+        <!-- Preview image (overlays canvas for photo / repair result / compare) -->
+        <img id="previewImg" class="preview-img" alt="preview" />
+      </div>
 
-        <section class="section">
-          <h2>场景</h2>
-          <div class="field">
-            <label for="plySelect">PLY 文件</label>
-            <select id="plySelect"></select>
-          </div>
-          <p class="hint">从 inputs/ 选择 PLY，在右侧预览中拖拽旋转到想要的视角。</p>
-        </section>
+      <!-- Upload prompt: centered "+" button -->
+      <div class="upload-prompt" id="uploadPrompt">
+        <label class="plus-btn" id="plusBtn">
+          <input id="photoInput" type="file" accept="image/png,image/jpeg,image/webp" />
+          <span class="plus-icon"></span>
+          <span class="plus-label">上传照片</span>
+        </label>
+        <p class="upload-hint">支持 JPG / PNG / WebP</p>
+      </div>
 
-        <section class="section">
-          <h2>补全参数</h2>
-          <div class="field">
-            <label for="prompt">提示词 (CLIPTextEncode 节点 126)</label>
-            <textarea id="prompt">fix the blank areas and distorted structure, preserve the object identity</textarea>
-          </div>
-          <div class="row2">
-            <div class="field">
-              <label for="steps">Steps (节点 125)</label>
-              <input id="steps" type="number" min="1" max="50" value="4" />
-            </div>
-            <div class="field">
-              <label for="megapixels">Megapixels (节点 123)</label>
-              <input id="megapixels" type="number" min="0.25" max="4" step="0.25" value="1" />
-            </div>
-          </div>
-          <div class="row2">
-            <div class="field">
-              <label for="seed">Seed (节点 118)</label>
-              <input id="seed" type="number" min="0" placeholder="留空=随机" />
-            </div>
-            <div class="field" style="align-self: end;">
-              <button id="randomSeedBtn" class="button secondary" type="button">随机 Seed</button>
-            </div>
-          </div>
-        </section>
-
-        <section class="section">
-          <h2>流程</h2>
-          <div class="steps">
-            <div class="step"><b>1</b><span class="hint">浏览器加载 PLY，拖拽选角度</span></div>
-            <div class="step"><b>2</b><span class="hint">截图当前 canvas 画面</span></div>
-            <div class="step"><b>3</b><span class="hint">上传到 ComfyUI，改 workflow 节点 76</span></div>
-            <div class="step"><b>4</b><span class="hint">FLUX.2 Klein 补全，从节点 9 取回结果</span></div>
-          </div>
-        </section>
-      </aside>
-
-      <section class="panel stage">
-        <div class="toolbar">
-          <h2>PLY 浏览器预览</h2>
-          <span class="hint">鼠标拖拽旋转 · 滚轮缩放 · 右键平移</span>
+      <!-- Top bar -->
+      <div class="top-bar" id="topBar">
+        <span class="brand-text">Flux Sharp</span>
+        <div class="status-dots">
+          <span class="status-pill"><span id="healthDot" class="status-dot" title="API"></span>API</span>
+          <span class="status-pill"><span id="comfyuiDot" class="status-dot offline" title="ComfyUI"></span>ComfyUI</span>
         </div>
+      </div>
 
-        <div class="canvas-wrap">
-          <canvas id="viewerCanvas" aria-label="PLY viewer"></canvas>
-          <div id="viewerOverlay" class="viewer-overlay">等待加载…</div>
+      <!-- Mode indicator for compare -->
+      <div class="mode-badge" id="modeBadge"></div>
+
+      <!-- 3D view hint -->
+      <div class="view-hint" id="viewHint">拖拽旋转 · 滚轮缩放 · 右键平移</div>
+
+      <!-- Spinner overlay -->
+      <div class="busy-overlay" id="busyOverlay">
+        <div class="busy-card">
+          <div class="busy-spinner"></div>
+          <span id="busyText">生成中…</span>
         </div>
-      </section>
+      </div>
 
-      <aside class="panel">
-        <section class="section">
-          <h2>截图并补全</h2>
-          <p class="hint">截取当前预览画面，送 ComfyUI FLUX.2 Klein 4B 补全。</p>
-          <div class="alert" id="alert"></div>
-          <div class="spinner" id="spinner">上传并执行 workflow…</div>
-          <div class="buttons" style="grid-template-columns: 1fr;">
-            <button id="captureBtn" class="button warn" type="button">截图并补全</button>
-          </div>
-        </section>
+      <!-- Bottom action bar -->
+      <div class="action-bar" id="actionBar">
+        <button id="generateBtn" class="btn btn-primary hidden" type="button" disabled>生成</button>
+        <button id="repairBtn" class="btn btn-primary hidden" type="button">修复</button>
+        <div class="post-group hidden" id="postGroup">
+          <button id="compareBtn" class="btn btn-glass" type="button">对比</button>
+          <button id="restoreBtn" class="btn btn-glass" type="button">恢复3D</button>
+          <button id="exportBtn" class="btn btn-glass" type="button">导出</button>
+        </div>
+      </div>
 
-        <section class="section output" id="outputSection" style="display: none;">
-          <h2>结果</h2>
-          <div>
-            <label>截图 (browser_view.png)</label>
-            <img id="screenshotImg" alt="screenshot" />
-          </div>
-          <div>
-            <label>补全结果 (repair_output.png)</label>
-            <img id="repairImg" alt="repair output" />
-          </div>
-          <p id="outputMeta" class="meta"></p>
-        </section>
-      </aside>
-    </main>
+      <!-- Error toast -->
+      <div class="error-toast" id="errorToast"></div>
+    </div>
 
     <script type="module" src="/web/app.js"></script>
   </body>
