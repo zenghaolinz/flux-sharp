@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from src import decode_subprocess_output
+
 
 # Job lifecycle states.
 STATE_PENDING = "pending"
@@ -140,10 +142,11 @@ class SharpRunner:
                 command,
                 check=False,
                 capture_output=True,
-                text=True,
                 timeout=1200,
             )
-            combined = (completed.stdout or "") + (completed.stderr or "")
+            stdout = decode_subprocess_output(completed.stdout)
+            stderr = decode_subprocess_output(completed.stderr)
+            combined = stdout + stderr
             with job._lock:
                 job.log = combined[-8000:]
             if completed.returncode != 0:
@@ -151,7 +154,7 @@ class SharpRunner:
                     job.state = STATE_FAILED
                     job.error = (
                         f"sharp predict exited with code {completed.returncode}.\n"
-                        f"{completed.stderr or completed.stdout or ''}"
+                        f"{stderr or stdout}"
                     )
                 return
 

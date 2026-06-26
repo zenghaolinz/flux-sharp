@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from typing import Any
 
+from src import decode_subprocess_output
+
 
 class RepairBackend(ABC):
     name = "base"
@@ -100,15 +102,16 @@ class ExternalCommandRepairBackend(RepairBackend):
             env=env,
             check=False,
             capture_output=True,
-            text=True,
             timeout=self.timeout_seconds,
         )
+        stdout = decode_subprocess_output(completed.stdout)
+        stderr = decode_subprocess_output(completed.stderr)
         if completed.returncode != 0:
             raise RuntimeError(
                 "External repair command failed.\n"
                 f"Command: {' '.join(command)}\n"
-                f"stdout:\n{completed.stdout}\n"
-                f"stderr:\n{completed.stderr}"
+                f"stdout:\n{stdout}\n"
+                f"stderr:\n{stderr}"
             )
         if not target.exists():
             raise RuntimeError(

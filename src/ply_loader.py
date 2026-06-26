@@ -122,6 +122,100 @@ def inspect_ply(path: str | Path) -> PlyInfo:
     )
 
 
+def read_ply_camera(path: str | Path) -> dict[str, Any] | None:
+    """Read camera parameters (extrinsic / intrinsic / image_size) from a SHARP PLY.
+
+    SHARP appends these elements after the vertex block. Returns ``None`` if the
+    PLY does not contain them (e.g. a plain point-cloud PLY).
+
+    Returns a dict with keys:
+      - ``extrinsic``: list[16] floats, row-major 4×4 world→camera matrix
+      - ``intrinsic``: list[9]  floats, row-major 3×3 K matrix (fx,fy,cx,cy…)
+      - ``image_size``: list[2] uints, [width, height] of the original photo
+    """
+    import struct
+
+    target = Path(path)
+    if not target.exists():
+        raise FileNotFoundError(f"PLY file does not exist: {target}")
+
+    # ── Parse header ──
+    header_lines: list[str] = []
+    header_bytes = 0
+    with target.open("rb") as f:
+        for raw in f:
+            header_bytes += len(raw)
+            line = raw.decode("ascii", errors="replace").strip()
+            header_lines.append(line)
+            if line == "end_header":
+                break
+        else:
+            raise ValueError(f"PLY header missing end_header: {target}")
+
+    # Parse all elements and their properties.
+    elements: list[dict[str, Any]] = []
+    cur_elem: dict[str, Any] | None = None
+    for line in header_lines[1:]:
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "element" and len(parts) >= 3:
+            cur_elem = {"name": parts[1], "count": int(parts[2]), "props": []}
+            elements.append(cur_elem)
+        elif parts[0] == "property" and cur_elem is not None:
+            cur_elem["props"].append((parts[1], parts[-1]))
+
+    elem_names = {e["name"] for e in elements}
+    if not {"extrinsic", "intrinsic", "image_size"}.issubset(elem_names):
+        return None
+
+    # ── Read binary data after header ──
+    type_map = {
+        "float": ("f", 4), "double": ("d", 8),
+        "int": ("i", 4), "uint": ("I", 4),
+        "uchar": ("B", 1), "ushort": ("H", 2), "short": ("h", 2),
+    }
+
+    result: dict[str, Any] = {}
+    with target.open("rb") as f:
+        f.seek(header_bytes)
+        for elem in elements:
+            count = elem["count"]
+            props = elem["props"]
+            # Build format string for one row of this element.
+            fmt_parts: list[str] = []
+            byte_size = 0
+            for ptype, _pname in props:
+                sc, sz = type_map.get(ptype, ("f", 4))
+                fmt_parts.append(sc)
+                byte_size += sz
+
+            total = byte_size * count
+            name = elem["name"]
+
+            if name == "vertex":
+                f.seek(total, 1)  # skip vertex binary blob
+                continue
+
+            raw = f.read(total)
+            if len(raw) < total:
+                break  # truncated file
+
+            fmt = "<" + ("".join(fmt_parts)) * count
+            vals = struct.unpack(fmt, raw)
+
+            if name == "extrinsic":
+                result["extrinsic"] = list(vals)      # 16 floats
+            elif name == "intrinsic":
+                result["intrinsic"] = list(vals)      # 9 floats
+            elif name == "image_size":
+                result["image_size"] = list(vals)     # 2 uints
+
+    if "extrinsic" not in result or "intrinsic" not in result or "image_size" not in result:
+        return None
+    return result
+
+
 def load_preview_vertices(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
     header = read_ply_header(path)
     if header["format"] == "binary_little_endian":

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 
+from src import decode_subprocess_output
 from src.camera import CameraParams
 from src.renderers.base import RenderBackend, RenderResult
 
@@ -40,14 +41,15 @@ class SharpCliRenderer(RenderBackend):
                 command,
                 check=False,
                 capture_output=True,
-                text=True,
             )
+            stdout = decode_subprocess_output(completed.stdout)
+            stderr = decode_subprocess_output(completed.stderr)
             if completed.returncode != 0:
                 raise RuntimeError(
                     "sharp render failed.\n"
                     f"Command: {' '.join(command)}\n"
-                    f"stdout:\n{completed.stdout}\n"
-                    f"stderr:\n{completed.stderr}"
+                    f"stdout:\n{stdout}\n"
+                    f"stderr:\n{stderr}"
                 )
 
             candidates = sorted(
