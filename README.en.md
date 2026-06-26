@@ -6,7 +6,7 @@ Local single-photo → 3D Gaussian Splat → view-repair pipeline with a browser
 
 Upload a photograph, regress a 3DGS `.ply` with Apple's [ml-sharp](https://github.com/apple/ml-sharp),
 orbit to the view you want in a WebGL preview, then send that raw 3DGS screenshot
-plus the original photo to a ComfyUI FLUX.2 Klein 4B workflow for hole-filling
+plus the original photo to a ComfyUI FLUX.2 Klein 9B workflow for hole-filling
 reconstruction.
 
 ```text
@@ -160,7 +160,7 @@ web/
                            gaussian-splats-3d.module.js (offline-capable)
 configs/                   Camera + repair configs (default_camera.json, repair_config.json, …)
 scripts/                   kill_port.ps1, probe_ply_camera.py, run_with_vsdevcmd.bat, …
-高斯泼溅修复工作流.json      ComfyUI API-format workflow (dual-image FLUX.2 Klein 4B)
+高斯泼溅修复工作流.json      ComfyUI API-format workflow (dual-image FLUX.2 Klein 9B)
 docs/                      renderer-spike.md, repair-backends.md
 models/                    VGGT splat-render config
 inputs/  outputs/  web_uploads/   Runtime data (gallery originals under web_uploads/gallery/)

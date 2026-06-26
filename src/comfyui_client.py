@@ -2,7 +2,7 @@
 
 This module talks to a local ComfyUI server using the official Server API:
 /upload/image, /prompt, /history/{id}, /view, and the /ws WebSocket. It drives
-the FLUX.2 Klein 4B API-format workflow (``高斯泼溅修复工作流.json`` in the project
+the FLUX.2 Klein 9B API-format workflow (``高斯泼溅修复工作流.json`` in the project
 root) by patching specific node ids, never by guessing node names.
 
 Workflow node contract (do not change the structure or model names):

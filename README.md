@@ -6,7 +6,7 @@
 
 上传一张照片，用 Apple [ml-sharp](https://github.com/apple/ml-sharp) 回归出
 3DGS `.ply`，在 WebGL 预览中旋转到想要的视角，再把该视角的 3DGS 原始截图连同原图
-一起发给 ComfyUI 的 FLUX.2 Klein 4B 工作流，完成空洞填补重构。
+一起发给 ComfyUI 的 FLUX.2 Klein 9B 工作流，完成空洞填补重构。
 
 ```text
 照片 ──sharp predict──▶ 3DGS .ply ──WebGL 旋转──▶ 原始截图
@@ -150,7 +150,7 @@ web/
                            gaussian-splats-3d.module.js（可离线运行）
 configs/                   相机与修复配置（default_camera.json、repair_config.json 等）
 scripts/                   kill_port.ps1、probe_ply_camera.py、run_with_vsdevcmd.bat 等
-高斯泼溅修复工作流.json      ComfyUI API 格式工作流（双图 FLUX.2 Klein 4B）
+高斯泼溅修复工作流.json      ComfyUI API 格式工作流（双图 FLUX.2 Klein 9B）
 docs/                      renderer-spike.md、repair-backends.md
 models/                    VGGT splat-render 配置
 inputs/  outputs/  web_uploads/   运行时数据（图库原图在 web_uploads/gallery/）
