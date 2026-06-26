@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import hashlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -60,19 +61,47 @@ def _save_manifest(manifest: dict[str, str]) -> None:
     )
 
 
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
 def _load_gallery() -> list[dict[str, Any]]:
     """Load the persistent gallery manifest.
 
-    The gallery stores stable file paths and URLs only; large image payloads stay
-    on disk under web_uploads/gallery so the UI can survive refresh/restart.
+    Gallery persistence intentionally stores original images only. Duplicate
+    uploads are allowed intentionally, so every upload keeps its own entry.
     """
     if not GALLERY_MANIFEST_PATH.exists():
         return []
     try:
         data = json.loads(GALLERY_MANIFEST_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
+        items = data if isinstance(data, list) else []
     except Exception:
         return []
+
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        photo_path = item.get("photo_path")
+        if not photo_path:
+            continue
+        abs_path = ROOT / photo_path
+        if not abs_path.exists():
+            continue
+        if not item.get("photo_hash"):
+            item["photo_hash"] = _sha256_file(abs_path)
+        out.append(item)
+
+    out.sort(key=lambda it: it.get("updated_at") or it.get("created_at") or 0, reverse=True)
+    return out
 
 
 def _save_gallery(items: list[dict[str, Any]]) -> None:
@@ -109,6 +138,7 @@ def _gallery_public_item(item: dict[str, Any]) -> dict[str, Any]:
         "photo_width": item.get("photo_width"),
         "photo_height": item.get("photo_height"),
         "photo_path": photo_path,
+        "photo_hash": item.get("photo_hash"),
         "photo_url": _file_url(photo_path),
         "created_at": item.get("created_at"),
         "updated_at": item.get("updated_at"),
@@ -351,27 +381,32 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
         photo_height = int(payload.get("photoHeight") or 0)
 
         raw, mime_type = _decode_upload(image_data)
+        photo_hash = _sha256_bytes(raw)
+        now = time()
+        items = _load_gallery()
+
         suffix = _extension_for_mime(mime_type, image_name)
         item_id = uuid4().hex
         safe_stem = re.sub(r"[^\w\-.]+", "_", Path(image_name).stem)[:60] or "photo"
-        photo_path = GALLERY_DIR / f"{item_id}_{safe_stem}{suffix}"
+        photo_path = GALLERY_DIR / f"{item_id[:12]}_{safe_stem}{suffix}"
         photo_path.parent.mkdir(parents=True, exist_ok=True)
         photo_path.write_bytes(raw)
 
-        now = time()
         item = {
             "id": item_id,
             "photo_name": image_name,
             "photo_width": photo_width,
             "photo_height": photo_height,
+            "photo_hash": photo_hash,
             "photo_path": str(photo_path.relative_to(ROOT)),
             "created_at": now,
             "updated_at": now,
         }
-        items = _load_gallery()
         items.append(item)
+        items.sort(key=lambda it: it.get("updated_at") or it.get("created_at") or 0, reverse=True)
         _save_gallery(items)
-        self._send_json({"item": _gallery_public_item(item)})
+        self._send_json({"item": _gallery_public_item(item), "deduped": False})
+
 
     def _gallery_update(self, payload: dict[str, Any]) -> None:
         item_id = payload.get("id")
@@ -403,42 +438,59 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
     def _gallery_list(self) -> None:
         items = _load_gallery()
         items.sort(key=lambda it: it.get("updated_at") or it.get("created_at") or 0, reverse=True)
+        _save_gallery(items)
         self._send_json({"items": [_gallery_public_item(it) for it in items]})
 
     def _gallery_upsert(self, payload: dict[str, Any]) -> None:
+        # Backward-compatible endpoint. It stores original images only.
         items = _load_gallery()
-        item_id = payload.get("id") or uuid4().hex
         now = time()
+        image_data = payload.get("photoDataUrl")
+
+        if image_data:
+            raw, mime_type = _decode_upload(image_data)
+            photo_hash = _sha256_bytes(raw)
+            item_id = payload.get("id") or uuid4().hex
+            name = payload.get("photoName") or "未命名照片"
+            suffix = _extension_for_mime(mime_type, name)
+            safe_stem = re.sub(r"[^\w\-.]+", "_", Path(name).stem)[:60] or "photo"
+            photo_path = GALLERY_DIR / f"{item_id[:12]}_{safe_stem}{suffix}"
+            photo_path.parent.mkdir(parents=True, exist_ok=True)
+            photo_path.write_bytes(raw)
+            existing = {
+                "id": item_id,
+                "created_at": now,
+                "updated_at": now,
+                "photo_hash": photo_hash,
+                "photo_path": str(photo_path.relative_to(ROOT)),
+                "photo_name": payload.get("photoName") or "未命名照片",
+                "photo_width": payload.get("photoWidth"),
+                "photo_height": payload.get("photoHeight"),
+            }
+            items.append(existing)
+            items.sort(key=lambda it: it.get("updated_at") or it.get("created_at") or 0, reverse=True)
+            _save_gallery(items)
+            self._send_json({"item": _gallery_public_item(existing)})
+            return
+
+        item_id = payload.get("id")
+        if not item_id:
+            raise ValueError("Missing 'id' or 'photoDataUrl' in gallery upsert payload.")
         existing = next((it for it in items if it.get("id") == item_id), None)
         if existing is None:
-            existing = {"id": item_id, "created_at": now}
-            items.append(existing)
-
+            raise ValueError(f"Unknown gallery item id: {item_id}")
         existing["updated_at"] = now
         if payload.get("photoName") is not None:
-            existing["photo_name"] = payload.get("photoName") or "未命名照片"
+            existing["photo_name"] = payload.get("photoName") or existing.get("photo_name") or "未命名照片"
         if payload.get("photoWidth") is not None:
             existing["photo_width"] = payload.get("photoWidth")
         if payload.get("photoHeight") is not None:
             existing["photo_height"] = payload.get("photoHeight")
-
-        image_data = payload.get("photoDataUrl")
-        if image_data and not existing.get("photo_path"):
-            raw, mime_type = _decode_upload(image_data)
-            suffix = _extension_for_mime(mime_type, existing.get("photo_name") or "photo.png")
-            safe_stem = re.sub(r"[^\w\-.]+", "_", Path(existing.get("photo_name") or "photo").stem)[:60] or "photo"
-            photo_path = GALLERY_DIR / f"{item_id}_{safe_stem}{suffix}"
-            photo_path.parent.mkdir(parents=True, exist_ok=True)
-            photo_path.write_bytes(raw)
-            existing["photo_path"] = str(photo_path.relative_to(ROOT))
-
         if payload.get("photoPath"):
             existing["photo_path"] = _rel_to_root(payload.get("photoPath"))
-
-        # Newest first on disk for predictable gallery order.
-        items.sort(key=lambda it: it.get("updated_at") or it.get("created_at") or 0, reverse=True)
         _save_gallery(items)
         self._send_json({"item": _gallery_public_item(existing)})
+
 
     def _create_session(self, payload: dict[str, Any]) -> None:
         session_id = uuid4().hex

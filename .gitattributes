@@ -1,0 +1,12 @@
+# Normalize line endings across Windows/macOS/Linux.
+# Git stores text files as LF in the repo; the working copy follows the OS
+# default (CRLF on Windows via core.autocrlf=true, LF elsewhere).
+
+# Source / text — always LF in the index
+*.{py,js,css,html,json,md,txt,bat,ps1,gitignore,gitkeep} text eol=lf
+
+# Binary assets — never touch
+*.{png,jpg,jpeg,gif,webp,ico,ply,bin,zip,gz,pkl,safetensors,pt,pth,onnx} binary
+
+# Catch-all: let Git auto-detect; text files normalize to LF.
+* text=auto eol=lf

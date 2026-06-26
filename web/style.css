@@ -145,6 +145,36 @@ body::after {
     inset 0 1px 0 rgba(255,255,255,0.20),
     inset 0 -30px 70px rgba(0,0,0,0.16);
 }
+
+.preview-close {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  z-index: 12;
+  width: 34px;
+  height: 34px;
+  border: 1px solid rgba(255,255,255,0.18);
+  border-radius: 999px;
+  background: rgba(8, 12, 20, 0.55);
+  color: rgba(255,255,255,0.92);
+  font-size: 24px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 10px 24px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.10);
+  backdrop-filter: blur(14px) saturate(1.3);
+  -webkit-backdrop-filter: blur(14px) saturate(1.3);
+}
+.preview-close:hover {
+  background: rgba(14, 22, 33, 0.76);
+  border-color: rgba(255,255,255,0.26);
+}
+.preview-close.hidden {
+  display: none;
+}
+
 .frame::after {
   content: "";
   position: absolute;
@@ -177,8 +207,16 @@ body::after {
   object-fit: cover;
   display: none;
   z-index: 3;
+  opacity: 1;
+  transition: opacity 560ms cubic-bezier(.22,.8,.22,1), filter 560ms cubic-bezier(.22,.8,.22,1);
+  will-change: opacity, filter;
 }
 .preview-img.visible { display: block; }
+.preview-img.splat-transition-out {
+  opacity: 0;
+  filter: blur(6px) saturate(1.08);
+  pointer-events: none;
+}
 
 /* Photo → 3D generation: liquid glass scan from top to bottom */
 .frame.is-generating::after {
@@ -601,4 +639,35 @@ body::after {
   flex: 0 0 auto;
   color: var(--cyan);
   opacity: 0.92;
+}
+
+/* Hide GaussianSplats3D built-in loading UI such as "Processing splats...".
+   Flux Sharp uses its own generation / reconstruction effects instead. */
+.canvas-container [class^="spinnerOuterContainer"],
+.canvas-container [class*=" spinnerOuterContainer"],
+.canvas-container [class^="spinnerContainer"],
+.canvas-container [class*=" spinnerContainer"],
+.canvas-container [class^="messageContainer"],
+.canvas-container [class*=" messageContainer"],
+.canvas-container [class^="spinnerPrimary"],
+.canvas-container [class*=" spinnerPrimary"] {
+  display: none !important;
+  opacity: 0 !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+/* During reconstruction the current 3D view is frozen so the raw screenshot
+   sent to ComfyUI matches the visible preview/camera at click time. */
+.frame.is-preview-locked .canvas-container,
+.canvas-container.locked {
+  pointer-events: none !important;
+  user-select: none;
+}
+.frame.is-preview-locked::before {
+  box-shadow:
+    inset 0 0 0 1px rgba(255,255,255,0.22),
+    inset 0 0 22px rgba(47,244,238,0.18),
+    inset 0 0 34px rgba(168,85,247,0.16),
+    inset 0 -30px 70px rgba(0,0,0,0.12);
 }
