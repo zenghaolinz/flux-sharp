@@ -1,192 +1,188 @@
-# MLSharp Flux Repair MVP
+# Flux Sharp
 
-Lightweight MVP for a local `ml-sharp` / 3DGS view-rendering and image-repair pipeline.
+Local single-photo → 3D Gaussian Splat → view-repair pipeline with a browser UI.
 
-The first milestone intentionally stays small:
+Upload a photograph, regress a 3DGS `.ply` with Apple's [ml-sharp](https://github.com/apple/ml-sharp),
+orbit to the view you want in a WebGL preview, then send that raw 3DGS screenshot
+plus the original photo to a ComfyUI FLUX.2 Klein 4B workflow for hole-filling
+reconstruction.
 
 ```text
-PLY -> renderer backend -> raw PNG render -> repair backend interface -> output manifest
+photo ──sharp predict──▶ 3DGS .ply ──WebGL orbit──▶ raw screenshot
+   │                                                    │
+   └────────────────────► ComfyUI FLUX.2 Klein ◀───────┘
+                          (原图 + 截图 双图修复) ──▶ repaired image
 ```
 
-## Current Scope
+The 3D preview, repair trigger, and gallery all live in the browser. The Python
+backend only runs `sharp predict`, brokers the ComfyUI call, and serves files.
 
-- Load ordinary PLY files with Open3D.
-- Inspect PLY headers and flag likely 3DGS files by Gaussian properties.
-- Store and validate camera parameters in JSON.
-- Render a PLY from a requested camera view with a selectable renderer backend.
-- Run a pluggable repair backend.
-- Ship a `dummy` repair backend that copies the raw render so the pipeline can be verified before model work begins.
-- Write a per-run output directory with render, repair result, logs, and `manifest.json`.
+## Quick start (Windows)
 
-Open3D and the software renderer are preview paths only. They may treat SHARP/3DGS `.ply` files as ordinary point clouds, so final image quality should be evaluated with a real 3D Gaussian Splatting renderer.
+```bat
+start.bat
+```
 
-## Install
+`start.bat` uses the bundled `.venv-sharp` interpreter and starts the web UI at
+<http://127.0.0.1:8765>. Press `Ctrl+C` in the console to stop.
+
+### Manual start
 
 ```bash
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python web_server.py          # serves http://127.0.0.1:8765
 ```
 
-## Run
+### What you need running
+
+| Service | Address | Started by |
+|---------|---------|------------|
+| Flux Sharp web UI | `127.0.0.1:8765` | `web_server.py` (this project) |
+| ComfyUI | `127.0.0.1:8188` | **manually** — not auto-started |
+| `sharp` CLI | on PATH or in `.venv-sharp/Scripts/` | bundled env |
+
+The web UI shows live status dots for the API and ComfyUI. ComfyUI must be
+online before clicking **重构**; `sharp predict` runs on demand when you click
+**生成**.
+
+## Environment
+
+The project ships a dedicated virtual environment at `.venv-sharp/` for the
+SHARP / CUDA stack:
+
+- `torch==2.8.0+cu128`, `torchvision==0.23.0+cu128`, `gsplat==1.5.3`
+- The `sharp` CLI (first `sharp predict` run downloads the default checkpoint)
+- A CUDA GPU — the runner forces `--device cuda`
+
+Web/backend deps are in `requirements.txt` (`numpy`, `open3d`, `Pillow`,
+`requests`, `websocket-client`, `huggingface-hub`, `pytest`). Install into the
+same interpreter the web UI runs on:
 
 ```bash
-python app.py --ply inputs/scene.ply --camera configs/default_camera.json --backend dummy --renderer auto --output outputs
+.venv-sharp\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-The command creates a timestamped run directory under `outputs/`.
+## How it works
 
-Renderer options:
+### 1. Upload → gallery
+
+Photos are uploaded to `/api/gallery/import`, stored under `web_uploads/gallery/`,
+and tracked in `web_uploads/gallery/gallery.json`. The gallery **stores originals
+only** — 3DGS `.ply` files, screenshots, and repair results are workflow state
+kept in memory and are not persisted. Duplicate uploads are allowed; each keeps
+its own entry.
+
+### 2. 生成 — SHARP image → 3DGS PLY
+
+Clicking **生成** queues a background `sharp predict` job (`src/sharp_runner.py`):
 
 ```text
-auto       Uses Open3D where practical, otherwise falls back to software preview.
-software   Pure Python/Pillow point-cloud projection; useful for Windows/headless smoke tests.
-open3d     Open3D OffscreenRenderer point-cloud preview.
-sharp-cli  Official apple/ml-sharp CLI validation path; requires `sharp` on PATH and CUDA for rendering.
+sharp predict -i <photo> -o <outdir> --device cuda  ->  <outdir>/<stem>.ply
 ```
 
-The official SHARP project says its `.ply` outputs are 3D Gaussian Splats, use the OpenCV convention `(x right, y down, z forward)`, and can be rendered through `sharp render` with CUDA.
+One job runs at a time (single GPU). The UI polls `/api/sharp/status` until the
+`.ply` is ready, then loads it into the GaussianSplats3D viewer.
 
-On Windows, run official SHARP/CUDA commands through:
+### 3. Orbit → screenshot
 
-```bash
-scripts\run_with_vsdevcmd.bat .venv-sharp\Scripts\python.exe app.py --ply inputs\scene.ply --renderer sharp-cli --backend dummy
-```
+The PLY is rendered in-browser with the vendored `GaussianSplats3D` library
+(Three.js). Orbit controls are damped and slowed so you can pick a precise view.
+A photo→3DGS cross-fade plays on load to avoid a black frame.
 
-The `.venv-sharp` environment is the dedicated official-renderer environment. It should use `torch==2.8.0+cu128`, `torchvision==0.23.0+cu128`, and `gsplat==1.5.3`.
+### 4. 重构 — ComfyUI double-image repair
 
-## Local Web UI
+Clicking **重构** captures the **raw** 3DGS render target (before any UI
+feathering) plus the original photo, and submits both to ComfyUI. Repair locks
+the preview so the screenshot matches the visible camera at click time.
 
-Start the camera-planning UI with:
+The client (`src/comfyui_client.py`) loads the API-format workflow at the
+project root — **`高斯泼溅修复工作流.json`** — patches only input fields
+(never structure or model loaders), and uses the official WebSocket + History
+flow: `/upload/image` → `/prompt` → listen on `/ws` for `executing` with
+`node is null` → `/history/{prompt_id}` → `/view`.
 
-```bash
-python web_server.py
-```
+#### Workflow node contract
 
-Then open:
+| Node | Class type            | Patched input      |
+|------|-----------------------|--------------------|
+| 81   | LoadImage             | `image` (screenshot) |
+| 158  | LoadImage             | `image` (original photo) |
+| 106  | CLIPTextEncode        | `text` (prompt)    |
+| 103  | RandomNoise           | `noise_seed`       |
+| 99   | Flux2Scheduler        | `steps`            |
+| 108  | ImageScaleToTotalPixels | `megapixels` (image 1) |
+| 109  | ImageScaleToTotalPixels | `megapixels` (image 2) |
+| 94   | SaveImage             | (output source)    |
+
+The repair prompt is built from the camera movement delta between the initial
+view and the chosen view (see `buildRepairPrompt` / `computeCameraMove` in
+`web/app.js`).
+
+## HTTP API
+
+Served by `web_server.py` on `127.0.0.1:8765`.
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/health` | GET | Backend liveness |
+| `/api/comfyui-status` | GET | ComfyUI online check (`127.0.0.1:8188/system_stats`) |
+| `/api/gallery` | GET | List gallery items (originals only, newest first) |
+| `/api/gallery/import` | POST | Upload a new original (SHA-256 hashed, dedup-allowed) |
+| `/api/gallery/upsert` | POST | Backward-compatible upsert (originals only) |
+| `/api/gallery/update` | POST | Update an item's metadata |
+| `/api/sharp/generate` | POST | Queue a `sharp predict` job for an item |
+| `/api/sharp/status` | GET | Poll the running SHARP job |
+| `/api/sharp/ply` | GET | Fetch the generated `.ply` for an item |
+| `/api/ply-vertex-only` | GET | Stream a vertex-only PLY for the viewer |
+| `/api/ply-camera` | GET | Read camera params from a PLY |
+| `/api/ply-files` | GET | List PLYs under `inputs/` |
+| `/api/repair-screenshot` | POST | Submit original + screenshot to ComfyUI, return repaired image |
+| `/api/sessions` | POST | Create an upload session dir |
+| `/api/export-camera` | POST | Export `CameraParams` JSON |
+| `/api/run-preview` | POST | Legacy server-side render (retained for debugging, not in UI) |
+| `/api/file` | GET | Generic static file passthrough |
+
+## Project layout
 
 ```text
-http://127.0.0.1:8765
-```
-
-The first web milestone supports:
-
-- Uploading a reference image into a local session under `web_uploads/`.
-- Selecting an existing PLY from `inputs/`.
-- Adjusting a camera-style orbit control for yaw, pitch, roll, distance, FOV, and output size.
-- Exporting the structured `CameraParams` JSON.
-- Running a preview render through the existing pipeline.
-- Sending the raw render and uploaded reference image to the ComfyUI Flux repair backend.
-
-Image-to-PLY generation is intentionally represented as a pipeline step in the UI, but is not wired into the web endpoint yet.
-
-The ComfyUI repair backend calls ComfyUI's `/free` endpoint before and after repair. The pipeline also asks the repair backend to release memory before rendering, then runs local CUDA/GC cleanup after rendering before submitting repair work. This keeps the SHARP render and Flux repair stages from holding VRAM at the same time.
-
-## Browser Preview + Screenshot Repair (default workflow)
-
-The default web UI flow is now browser-side:
-
-```text
-photo -> sharp predict (image -> 3DGS .ply) -> WebGL preview (Three.js)
-      -> drag to choose angle -> canvas screenshot
-      -> ComfyUI FLUX.2 Klein 4B workflow -> repaired output
-```
-
-A user uploads a photograph; the backend runs `sharp predict` to regress a 3D
-Gaussian Splat `.ply`, loads it into the Three.js preview, and the user orbits
-to the desired view. The screenshot is then sent to ComfyUI for repair. The
-backend no longer re-renders the PLY from camera parameters; it only saves the
-screenshot, patches the workflow's node ids, submits it to ComfyUI, waits over
-WebSocket, and downloads the result.
-
-### Image-to-PLY (SHARP)
-
-The photo-to-PLY step uses Apple's [ml-sharp](https://github.com/apple/ml-sharp)
-`sharp predict` command, which regresses a 3DGS `.ply` from a single photograph:
-
-```text
-sharp predict -i <image> -o <outdir>  ->  <outdir>/<image_stem>.ply
-```
-
-Requirements:
-
-- The `.venv-sharp` environment (torch 2.8.0+cu128, gsplat 1.5.3, CUDA).
-- The `sharp` CLI on PATH or in `.venv-sharp/Scripts/`. On first run `sharp
-  predict` downloads the default checkpoint automatically.
-- A CUDA GPU (the runner forces `--device cuda`).
-
-The web UI uploads the photo, queues a background `sharp predict` job, and
-polls `/api/sharp/status` until the `.ply` is ready, then loads it into the
-preview. One job runs at a time (single GPU).
-
-### ComfyUI monitoring
-
-The web UI polls `http://127.0.0.1:8188/system_stats` and shows a ComfyUI
-status dot (green = online, grey = offline). ComfyUI is **not** auto-started;
-launch it manually before repairing. The repair client connects to
-`127.0.0.1:8188`.
-
-Setup:
-
-1. Place the API-format workflow `FLUX.2+Klein+4B.json` in the project root.
-   It must be API-format (keyed by node id), not UI-format (with `nodes`/`links`).
-2. Start ComfyUI at `127.0.0.1:8188`.
-3. Start this web UI:
-
-   ```bash
-   python web_server.py
-   ```
-
-4. Open http://127.0.0.1:8765, select a `.ply` from `inputs/`, orbit to the
-   desired view, and click "截图并补全".
-
-### Workflow node contract
-
-The client only patches these node ids (never the structure or model names):
-
-| Node | Class type            | Patched input   |
-|------|-----------------------|-----------------|
-| 76   | LoadImage             | `image`         |
-| 126  | CLIPTextEncode        | `text`          |
-| 118  | RandomNoise           | `noise_seed`    |
-| 125  | Flux2Scheduler        | `steps`         |
-| 123  | ImageScaleToTotalPixels | `megapixels`  |
-| 9    | SaveImage             | (output source) |
-
-Communication uses the official WebSocket + History pattern: upload via
-`/upload/image`, submit via `/prompt`, listen on `/ws` for `executing` with
-`node is null`, then fetch `/history/{prompt_id}` and download via `/view`. The
-client does not poll ComfyUI's output folder or write to its input folder.
-
-The legacy `/api/run-preview` endpoint and the `src/repair/comfyui_flux.py`
-double-image backend are retained for debugging but are no longer exposed in the
-UI. Three.js (PLYLoader, OrbitControls) is vendored under `web/vendor/` so the
-page works offline.
-
-## Project Layout
-
-```text
-app.py
-configs/
-inputs/
-models/
-outputs/
+web_server.py              Web UI + API server (entry point)
+start.bat                  One-click launcher (.venv-sharp)
 src/
-tests/
+  sharp_runner.py          Background `sharp predict` runner (singleton, 1 GPU job)
+  comfyui_client.py        ComfyUI WebSocket client + double-image workflow driver
+  pipeline.py              Legacy render/repair pipeline (CLI path)
+  camera.py, ply_loader.py, renderer.py, renderers/   Renderer backends
+  repair/                  Repair backends (comfyui_flux.py legacy single-image)
+web/
+  app.js, index.html, style.css   Browser UI (GaussianSplats3D + Three.js)
+  vendor/                  Vendored three.module.js, PLYLoader, OrbitControls,
+                           gaussian-splats-3d.module.js (offline-capable)
+configs/                   Camera + repair configs (default_camera.json, repair_config.json, …)
+scripts/                   kill_port.ps1, probe_ply_camera.py, run_with_vsdevcmd.bat, …
+高斯泼溅修复工作流.json      ComfyUI API-format workflow (double-image FLUX.2 Klein 4B)
+docs/                      renderer-spike.md, repair-backends.md
+models/                    VGGT splat-render config
+inputs/  outputs/  web_uploads/   Runtime data (gallery originals under web_uploads/gallery/)
 ```
 
-## Next Milestones
+## CLI (legacy)
 
-1. Validate SHARP-generated `.ply` files against Open3D and a true 3DGS renderer.
-2. Map `CameraParams` to SHARP/OpenCV camera conventions for exact single-view rendering.
-3. Add a spike for `vggt-splat-render`: repository, license, input/output contract, VRAM needs.
-4. Add a Flux/LoRA repair backend after confirming loading mechanics and license constraints.
-5. Add batch camera generation and a small evaluation set.
+`app.py` is the original CLI pipeline (`--ply`, `--camera`, `--renderer`,
+`--backend`). It is retained for renderer/repair debugging and smoke tests but is
+not the main flow — the web UI is. Renderer backends: `auto`, `software`
+(Pillow projection), `open3d` (point-cloud preview), `sharp-cli` (official
+ml-sharp, CUDA). See `docs/renderer-spike.md`.
 
-Repair backend notes live in [docs/repair-backends.md](docs/repair-backends.md).
+```bash
+scripts\run_with_vsdevcmd.bat .venv-sharp\Scripts\python.exe app.py \
+  --ply inputs/scene.ply --renderer sharp-cli --backend dummy
+```
 
-## UI refactor v4 notes
+## Notes
 
-- The gallery is now persisted on the backend in `web_uploads/gallery/gallery.json`; uploaded originals are stored under `web_uploads/gallery/`, so the gallery can be restored after refresh/restart.
-- Gallery items keep original photo, generated PLY, latest raw 3DGS screenshot, and latest reconstruction result.
-- Reconstruction screenshots sent to ComfyUI are captured from the raw GaussianSplats3D render target before UI feathering/edge fill is applied. The user preview can stay visually softened, while ComfyUI still receives the black-hole/sparse 3DGS image that matches the LoRA training domain.
+- The browser receives the **raw** 3DGS screenshot (with black holes / sparse
+  regions), matching the LoRA repair training domain. The user-facing preview may
+  be visually softened, but ComfyUI always gets the raw render.
+- The repair client calls ComfyUI's `/free` before and after repair so the SHARP
+  stage and the Flux repair stage don't hold VRAM simultaneously.
+- Three.js, PLYLoader, OrbitControls, and GaussianSplats3D are vendored under
+  `web/vendor/` so the page works fully offline.
