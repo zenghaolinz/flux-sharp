@@ -28,3 +28,6 @@ scripts/cleanup_plies.py
 models/**/*.safetensors
 models/**/*.ckpt
 models/**/*.bin
+
+# Editor / agent local skill caches (not part of the project)
+.qoder/
