@@ -18,6 +18,17 @@
 3D 预览、修复触发、图库都跑在浏览器里。Python 后端只负责运行 `sharp predict`、
 中转 ComfyUI 调用、以及提供文件服务。
 
+## 项目简介
+
+利用 Flux2Klein、`siraxe/cyrildiagne_flux2-klein9b-lora-mlsharp-3d-repair` LoRA
+与 Apple ML-SHARP 实现的单图 3D Gaussian Splatting 视角重绘工具。
+
+项目通过 Apple ML-SHARP 将单张输入图片生成 3DGS 预览，支持在浏览器中旋转、缩放并
+选择新的观察角度，再结合 Flux2Klein 与专用 3D repair LoRA 对当前 3DGS 渲染结果
+进行重构、修复与补全，用于改善高斯泼溅在视角变化时产生的空洞、拉伸、物体畸变、
+建筑扭曲、脸部变形和背景缺失等问题。
+
+
 ## 快速开始（Windows）
 
 ```bat

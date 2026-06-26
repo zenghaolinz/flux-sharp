@@ -19,6 +19,20 @@ photo ──sharp predict──▶ 3DGS .ply ──WebGL orbit──▶ raw scre
 The 3D preview, repair trigger, and gallery all live in the browser. The Python
 backend only runs `sharp predict`, brokers the ComfyUI call, and serves files.
 
+## Overview
+
+A single-image 3D Gaussian Splatting view-repainting tool built on Flux2Klein,
+the `siraxe/cyrildiagne_flux2-klein9b-lora-mlsharp-3d-repair` LoRA, and
+Apple ML-SHARP.
+
+Apple ML-SHARP turns a single input photo into a 3DGS preview. You can orbit,
+zoom, and pick a new viewing angle in the browser, then Flux2Klein together with
+a dedicated 3D repair LoRA reconstructs, repairs, and completes the current 3DGS
+render. This addresses the holes, stretching, object distortion, architectural
+warping, face deformation, and background loss that Gaussian splatting produces
+when the viewpoint changes.
+
+
 ## Quick start (Windows)
 
 ```bat
