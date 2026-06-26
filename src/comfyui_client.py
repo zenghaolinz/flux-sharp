@@ -2,17 +2,19 @@
 
 This module talks to a local ComfyUI server using the official Server API:
 /upload/image, /prompt, /history/{id}, /view, and the /ws WebSocket. It drives
-the FLUX.2 Klein 4B API-format workflow (``FLUX.2+Klein+4B.json`` in the project
+the FLUX.2 Klein 4B API-format workflow (``高斯泼溅修复工作流.json`` in the project
 root) by patching specific node ids, never by guessing node names.
 
 Workflow node contract (do not change the structure or model names):
 
-    76  LoadImage               -> inputs.image = uploaded screenshot name
-    126 CLIPTextEncode          -> inputs.text  = prompt (optional)
-    118 RandomNoise             -> inputs.noise_seed = seed (optional)
-    125 Flux2Scheduler          -> inputs.steps = steps (optional)
-    123 ImageScaleToTotalPixels -> inputs.megapixels = megapixels (optional)
-    9   SaveImage               -> final output image comes from here
+    81  LoadImage               -> inputs.image = rotated screenshot (image 2)
+    158 LoadImage               -> inputs.image = original photo (image 1)
+    106 CLIPTextEncode          -> inputs.text  = prompt (optional)
+    103 RandomNoise             -> inputs.noise_seed = seed (optional)
+    99  Flux2Scheduler          -> inputs.steps = steps (optional)
+    108 ImageScaleToTotalPixels -> inputs.megapixels = megapixels for image 1 (optional)
+    109 ImageScaleToTotalPixels -> inputs.megapixels = megapixels for image 2 (optional)
+    94  SaveImage               -> final output image comes from here
 """
 
 from __future__ import annotations
@@ -29,13 +31,15 @@ import websocket
 # Workflow node ids that this client is allowed to patch. Anything outside this
 # set is left untouched so the workflow structure and model loaders are never
 # altered.
-REQUIRED_NODES = ("76", "9", "118", "123", "125", "126")
-NODE_LOAD_IMAGE = "76"
-NODE_SAVE_IMAGE = "9"
-NODE_RANDOM_NOISE = "118"
-NODE_IMAGE_SCALE = "123"
-NODE_FLUX2_SCHEDULER = "125"
-NODE_CLIP_TEXT_ENCODE = "126"
+REQUIRED_NODES = ("81", "158", "94", "99", "103", "106", "108", "109")
+NODE_LOAD_IMAGE_1 = "158"   # original photo (image 1 in prompt)
+NODE_LOAD_IMAGE_2 = "81"    # rotated screenshot (image 2 in prompt)
+NODE_SAVE_IMAGE = "94"
+NODE_RANDOM_NOISE = "103"
+NODE_IMAGE_SCALE_1 = "108"  # megapixels for image 1 (node 158 -> 108)
+NODE_IMAGE_SCALE_2 = "109"  # megapixels for image 2 (node 81 -> 109)
+NODE_FLUX2_SCHEDULER = "99"
+NODE_CLIP_TEXT_ENCODE = "106"
 
 
 class ComfyUIError(RuntimeError):
@@ -163,7 +167,8 @@ class ComfyUIClient:
     def run_flux2_klein_workflow(
         self,
         workflow_path: Path,
-        input_image_path: Path,
+        input_image1_path: Path,
+        input_image2_path: Path,
         output_path: Path,
         prompt: str | None = None,
         seed: int | None = None,
@@ -175,11 +180,13 @@ class ComfyUIClient:
         workflow = _load_workflow(workflow_path)
         _validate_workflow(workflow)
 
-        # 1. Upload the browser screenshot to ComfyUI /upload/image.
-        uploaded_name = self.upload_image(input_image_path)
+        # 1. Upload both images to ComfyUI /upload/image.
+        uploaded_name1 = self.upload_image(input_image1_path)
+        uploaded_name2 = self.upload_image(input_image2_path)
 
         # 2. Patch only the documented node ids.
-        workflow[NODE_LOAD_IMAGE]["inputs"]["image"] = uploaded_name
+        workflow[NODE_LOAD_IMAGE_1]["inputs"]["image"] = uploaded_name1
+        workflow[NODE_LOAD_IMAGE_2]["inputs"]["image"] = uploaded_name2
         if prompt is not None:
             workflow[NODE_CLIP_TEXT_ENCODE]["inputs"]["text"] = prompt
         if seed is not None:
@@ -187,7 +194,8 @@ class ComfyUIClient:
         if steps is not None:
             workflow[NODE_FLUX2_SCHEDULER]["inputs"]["steps"] = int(steps)
         if megapixels is not None:
-            workflow[NODE_IMAGE_SCALE]["inputs"]["megapixels"] = float(megapixels)
+            workflow[NODE_IMAGE_SCALE_1]["inputs"]["megapixels"] = float(megapixels)
+            workflow[NODE_IMAGE_SCALE_2]["inputs"]["megapixels"] = float(megapixels)
 
         # 3. Queue the prompt and wait for it to finish via WebSocket.
         client_id = f"flux-sharp-{uuid.uuid4().hex}"
@@ -220,7 +228,7 @@ class ComfyUIClient:
 def _load_workflow(workflow_path: Path) -> dict[str, Any]:
     if not workflow_path.exists():
         raise ComfyUIError(
-            f"FLUX.2+Klein+4B.json not found in project root "
+            f"Workflow file not found "
             f"(expected at {workflow_path})."
         )
     try:
@@ -234,7 +242,7 @@ def _load_workflow(workflow_path: Path) -> dict[str, Any]:
     # never try to blindly convert it.
     if "nodes" in data and "links" in data:
         raise ComfyUIError(
-            "FLUX.2+Klein+4B.json is a UI-format workflow (has 'nodes'/'links'), "
+            "Workflow file is a UI-format workflow (has 'nodes'/'links'), "
             "not an API-format workflow. Export the API-format JSON from ComfyUI."
         )
     return data

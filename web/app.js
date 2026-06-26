@@ -16,21 +16,17 @@ import { Viewer, SceneFormat } from "/web/vendor/gaussian-splats-3d.module.js";
 const $ = (id) => document.getElementById(id);
 
 // ---------------------------------------------------------------------------
-// Hardcoded repair prompt (sent to ComfyUI, not shown to user)
+// Repair prompt builder — fills in camera movement coordinates.
 // ---------------------------------------------------------------------------
-const REPAIR_PROMPT = `请将这张高斯泼溅、点云渲染或三维重建图像修复成一张干净、真实、自然的照片。
-
-请去除图像中的重建伪影与结构错误，包括但不限于：点状噪声、黑灰色颗粒、雾状拖影、半透明残影、破碎边缘、孔洞、模糊块、漂浮碎片、错误的深度层次、边缘污染、网格背景、不完整几何结构、局部拉伸、重影和错位。
-
-请同时修复人物与物体的局部畸变问题，包括人脸畸变、五官错位、面部模糊、手部变形、手指数量异常、肢体扭曲、人体结构错误、重复人物、重复肢体，以及物体形状破损、弯折、融化、断裂或不连贯的问题。
-
-如果图像中包含文字、标牌、屏幕或建筑细节，请尽可能恢复其合理结构，避免出现扭曲文字、错误字符、模糊标识和不自然的细节。
-
-请根据原图中已有的内容、透视关系、光照方向、颜色风格和空间结构，自然补全缺失区域。补全结果要符合真实世界逻辑，主体完整，边缘干净，材质真实，空间连续，远近关系合理。
-
-请保持原始构图、相机视角、主体位置、场景布局和整体氛围不变。不要随意改变主体，不要添加无关物体，不要改变拍摄角度，也不要把原图重构成完全不同的场景。
-
-修复后的图像应像真实相机或手机拍摄的照片，光照自然，色彩统一，细节清晰但不过度锐化，纹理真实，几何稳定，没有明显的 AI 修复痕迹。`;
+function buildRepairPrompt(camMove) {
+  const m = camMove;
+  return (
+    `Referring to the scene in image 1, restore the perspective of the scene in image 2. ` +
+    `Repair the perspective and missing areas. ` +
+    `The camera has moved by: ` +
+    `{"x":${m.x},"y":${m.y},"z":${m.z},"pitch":${m.pitch},"yaw":${m.yaw},"roll":${m.roll}}`
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -48,6 +44,8 @@ const state = {
   repairUrl: null,      // repair result URL
   comparing: false,     // true = showing screenshot, false = showing repair
   inRepairView: false,  // true = repair result is showing, preview image overlays canvas
+  initialCameraPos: null,   // THREE.Vector3 — camera position at initial view
+  initialCameraQuat: null,  // THREE.Quaternion — camera orientation at initial view
 };
 
 // ---------------------------------------------------------------------------
@@ -288,9 +286,11 @@ async function loadSplatPreview(plyUrl) {
   // Start the self-driven render loop.
   viewer.start();
 
-  // ── Auto-fit camera to model bounding box ──
-  // Position the camera so the model fills the frame similarly to the
-  // original photo, fixing the "too far / wrong angle" issue.
+  // ── Camera positioning ──
+  // Try to read the original camera parameters (extrinsic + intrinsic)
+  // embedded in the SHARP PLY. If available, position the Three.js camera
+  // to exactly match the original photo's viewpoint. Otherwise fall back
+  // to bounding-box auto-fit.
   const splatMesh = viewer.splatMesh;
   if (splatMesh && splatMesh.getSplatCount() > 0) {
     const bbox = splatMesh.computeBoundingBox(true);
@@ -299,27 +299,121 @@ async function loadSplatPreview(plyUrl) {
     const size = new THREE.Vector3();
     bbox.getSize(size);
 
-    // Use height-based framing for portrait photos.
-    // The subject (person) typically occupies most of the vertical space.
     const camera = viewer.camera;
-    const fovRad = (camera.fov * Math.PI) / 180;
-    // Match the model height to fill ~190% of the frame vertically (zoomed in).
-    const padding = 1.9;
-    const dist = (size.y / 2) / Math.tan(fovRad / 2) / padding;
 
-    // Position camera in front of the model center, looking at center.
-    // SHARP outputs Y-down; original camera looks from -Z towards +Z.
-    camera.position.set(center.x, center.y, center.z - dist);
-    camera.lookAt(center);
-    camera.updateProjectionMatrix();
-
-    // Update OrbitControls target so rotation orbits around the model center.
-    if (viewer.controls && viewer.controls.target) {
-      viewer.controls.target.copy(center);
-      viewer.controls.update();
+    // ── Fetch PLY camera parameters ──
+    let camParams = null;
+    if (state.plyPath) {
+      try {
+        const camData = await api(
+          `/api/ply-camera?path=${encodeURIComponent(state.plyPath)}`
+        );
+        if (camData.available) {
+          camParams = camData;
+        }
+      } catch (e) {
+        console.warn("[loadSplatPreview] Failed to fetch PLY camera params:", e);
+      }
     }
 
-    console.log(`[loadSplatPreview] Auto-fit camera: center=(${center.x.toFixed(2)}, ${center.y.toFixed(2)}, ${center.z.toFixed(2)}), size=(${size.x.toFixed(2)}, ${size.y.toFixed(2)}, ${size.z.toFixed(2)}), dist=${dist.toFixed(2)}`);
+    if (camParams) {
+      // ── Use PLY extrinsic + intrinsic for exact viewpoint match ──
+      // Extrinsic E is a 4×4 row-major world→camera matrix: [R|t; 0 1]
+      // Camera position in world:  C = -R^T · t
+      // Camera forward in world:   R row 3 (the +Z axis in camera space)
+      // Camera up in world:       -R row 2 (the -Y axis in camera space)
+      const E = camParams.extrinsic;   // 16 floats
+      const K = camParams.intrinsic;   // 9 floats
+      const [imgW, imgH] = camParams.image_size;
+
+      // Extract R (3×3) and t (3×1) from the 4×4 extrinsic.
+      const R = [
+        [E[0], E[1], E[2]],
+        [E[4], E[5], E[6]],
+        [E[8], E[9], E[10]],
+      ];
+      const t = [E[3], E[7], E[11]];
+
+      // C = -R^T · t
+      const Cx = -(R[0][0]*t[0] + R[1][0]*t[1] + R[2][0]*t[2]);
+      const Cy = -(R[0][1]*t[0] + R[1][1]*t[1] + R[2][1]*t[2]);
+      const Cz = -(R[0][2]*t[0] + R[1][2]*t[1] + R[2][2]*t[2]);
+
+      // Forward direction = third row of R
+      const dx = R[2][0], dy = R[2][1], dz = R[2][2];
+      // Up direction = negative second row of R
+      const ux = -R[1][0], uy = -R[1][1], uz = -R[1][2];
+
+      // Set camera position, up, and look-at direction.
+      camera.position.set(Cx, Cy, Cz);
+      camera.up.set(ux, uy, uz);
+      camera.lookAt(Cx + dx, Cy + dy, Cz + dz);
+
+      // Set vertical FOV from intrinsic matrix.
+      // K[0] = fx, K[4] = fy (row-major 3×3)
+      const fy = K[4];
+      if (fy > 0 && imgH > 0) {
+        const fovRad = 2 * Math.atan(imgH / (2 * fy));
+        camera.fov = (fovRad * 180) / Math.PI;
+      }
+      camera.updateProjectionMatrix();
+
+      console.log(
+        `[loadSplatPreview] PLY camera: pos=(${Cx.toFixed(2)}, ${Cy.toFixed(2)}, ${Cz.toFixed(2)}), ` +
+        `dir=(${dx.toFixed(2)}, ${dy.toFixed(2)}, ${dz.toFixed(2)}), ` +
+        `up=(${ux.toFixed(2)}, ${uy.toFixed(2)}, ${uz.toFixed(2)}), ` +
+        `fov=${camera.fov.toFixed(1)}°, imgSize=${imgW}×${imgH}`
+      );
+
+      // ── OrbitControls target: project model center onto forward ray ──
+      // The bounding-box center can be pulled far off-axis by outlier
+      // splats.  Projecting it onto the camera's forward ray keeps the
+      // orbit target on the view direction while preserving a reasonable
+      // depth for rotation.
+      if (viewer.controls && viewer.controls.target) {
+        const fwdLen = Math.sqrt(dx*dx + dy*dy + dz*dz) || 1;
+        const nfx = dx / fwdLen, nfy = dy / fwdLen, nfz = dz / fwdLen;
+        // Vector from camera to model center
+        const vx = center.x - Cx, vy = center.y - Cy, vz = center.z - Cz;
+        // Project onto forward ray
+        const proj = vx * nfx + vy * nfy + vz * nfz;
+        viewer.controls.target.set(
+          Cx + nfx * proj,
+          Cy + nfy * proj,
+          Cz + nfz * proj
+        );
+        viewer.controls.update();
+      }
+    } else {
+      // ── Fallback: bounding-box auto-fit ──
+      const fovRad = (camera.fov * Math.PI) / 180;
+      const padding = 1.9;
+      const dist = (size.y / 2) / Math.tan(fovRad / 2) / padding;
+      camera.position.set(center.x, center.y, center.z - dist);
+      camera.lookAt(center);
+      camera.updateProjectionMatrix();
+
+      // OrbitControls target = model center (standard for fallback).
+      if (viewer.controls && viewer.controls.target) {
+        viewer.controls.target.copy(center);
+        viewer.controls.update();
+      }
+
+      console.log(
+        `[loadSplatPreview] Fallback auto-fit: center=(${center.x.toFixed(2)}, ${center.y.toFixed(2)}, ${center.z.toFixed(2)}), ` +
+        `size=(${size.x.toFixed(2)}, ${size.y.toFixed(2)}, ${size.z.toFixed(2)}), dist=${dist.toFixed(2)}`
+      );
+    }
+
+    // ── Record initial camera state for rotation tracking ──
+    // Store position & quaternion AFTER all camera setup (including
+    // OrbitControls target + update) so the delta reflects user rotation.
+    state.initialCameraPos = camera.position.clone();
+    state.initialCameraQuat = camera.quaternion.clone();
+    console.log(
+      `[loadSplatPreview] Initial camera: pos=(${state.initialCameraPos.x.toFixed(2)}, ${state.initialCameraPos.y.toFixed(2)}, ${state.initialCameraPos.z.toFixed(2)}), ` +
+      `quat=(${state.initialCameraQuat.x.toFixed(3)}, ${state.initialCameraQuat.y.toFixed(3)}, ${state.initialCameraQuat.z.toFixed(3)}, ${state.initialCameraQuat.w.toFixed(3)})`
+    );
   }
 
   // Attach real-time edge feathering post-processing.
@@ -500,6 +594,46 @@ function captureScreenshot() {
 }
 
 // ---------------------------------------------------------------------------
+// Compute camera movement delta (position + rotation) from initial view.
+// Returns { x, y, z, pitch, yaw, roll } with position in world units and
+// angles in degrees.  Rotation is computed as the quaternion delta
+// (current × initial⁻¹) converted to Euler angles in 'YXZ' order so that
+// Y = yaw, X = pitch, Z = roll.
+// ---------------------------------------------------------------------------
+function computeCameraMove() {
+  if (!state.viewer || !state.initialCameraPos || !state.initialCameraQuat) {
+    return { x: 0, y: 0, z: 0, pitch: 0, yaw: 0, roll: 0 };
+  }
+
+  const camera = state.viewer.camera;
+  const curPos = camera.position;
+  const curQuat = camera.quaternion;
+
+  // Position delta (world space = initial camera space for identity extrinsic).
+  const dx = curPos.x - state.initialCameraPos.x;
+  const dy = curPos.y - state.initialCameraPos.y;
+  const dz = curPos.z - state.initialCameraPos.z;
+
+  // Rotation delta: Δq = q_current · q_initial⁻¹
+  const invInit = state.initialCameraQuat.clone().invert();
+  const deltaQuat = curQuat.clone().multiply(invInit);
+
+  // Convert to Euler angles (YXZ order: yaw=Y, pitch=X, roll=Z).
+  const euler = new THREE.Euler().setFromQuaternion(deltaQuat, "YXZ");
+
+  const round2 = (v) => Math.round(v * 100) / 100;
+
+  return {
+    x: round2(dx),
+    y: round2(dy),
+    z: round2(dz),
+    pitch: round2(THREE.MathUtils.radToDeg(euler.x)),
+    yaw: round2(THREE.MathUtils.radToDeg(euler.y)),
+    roll: round2(THREE.MathUtils.radToDeg(euler.z)),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Repair: screenshot current view → send to ComfyUI
 // ---------------------------------------------------------------------------
 async function repair() {
@@ -513,13 +647,21 @@ async function repair() {
     setBusy(true, "正在截取画面…");
     const screenshotDataUrl = await captureScreenshot();
 
-    // Send to ComfyUI for repair.
+    // ── Compute camera movement delta ──
+    const camMove = computeCameraMove();
+    console.log("[repair] Camera move:", camMove);
+
+    // Build prompt with camera movement coordinates.
+    const prompt = buildRepairPrompt(camMove);
+
+    // Send original photo + screenshot to ComfyUI for repair.
     setBusy(true, "正在修复图像…");
     const repairData = await api("/api/repair-screenshot", {
       method: "POST",
       body: JSON.stringify({
+        photo: state.photoDataUrl,
         screenshot: screenshotDataUrl,
-        prompt: REPAIR_PROMPT,
+        prompt: prompt,
         steps: 4,
         megapixels: 1,
         ply_path: state.plyPath,

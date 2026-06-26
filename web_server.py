@@ -15,6 +15,7 @@ from src.comfyui_client import ComfyUIClient, ComfyUIError
 from src.pipeline import run_pipeline
 from src.renderers import create_render_backend
 from src.repair import create_repair_backend, load_repair_config
+from src.ply_loader import read_ply_camera
 from src.sharp_runner import SharpRunner
 
 
@@ -41,7 +42,9 @@ def _load_manifest() -> dict[str, str]:
 
 def _save_manifest(manifest: dict[str, str]) -> None:
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+    MANIFEST_PATH.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 def _ply_base_name(ply_name: str) -> str:
@@ -212,6 +215,14 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 target = _safe_workspace_path(query.get("path", [""])[0])
                 self._serve_vertex_only_ply(target)
+            elif parsed.path == "/api/ply-camera":
+                query = parse_qs(parsed.query)
+                target = _safe_workspace_path(query.get("path", [""])[0])
+                cam = read_ply_camera(target)
+                if cam is None:
+                    self._send_json({"available": False})
+                else:
+                    self._send_json({"available": True, **cam})
             elif parsed.path == "/api/comfyui-status":
                 self._send_json(
                     {"online": _comfyui_online(), "server": COMFYUI_SERVER}
@@ -314,27 +325,37 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
         )
 
     def _repair_screenshot(self, payload: dict[str, Any]) -> None:
-        # Browser-preview workflow: the front-end sends a canvas screenshot of
-        # the current Three.js view; we save it, upload it to ComfyUI, drive the
-        # FLUX.2 Klein workflow, and return the repaired image URL.
+        # Browser-preview workflow (two-image): the front-end sends the original
+        # photo (image 1) and a canvas screenshot of the rotated 3D view
+        # (image 2).  We save both, upload to ComfyUI, drive the FLUX.2 Klein
+        # workflow, and return the repaired image URL.
         if "screenshot" not in payload:
             raise ValueError("Missing 'screenshot' data URL in request body.")
+        if "photo" not in payload:
+            raise ValueError("Missing 'photo' data URL in request body.")
 
         session_id = payload.get("session_id") or uuid4().hex
         run_dir = OUTPUT_ROOT / f"browser_{session_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save original photo (image 1) and screenshot (image 2).
+        photo_raw, photo_mime = _decode_upload(payload["photo"])
+        photo_ext = _extension_for_mime(photo_mime, "photo.png")
+        photo_path = run_dir / f"photo{photo_ext}"
+        photo_path.write_bytes(photo_raw)
 
         raw, _mime = _decode_upload(payload["screenshot"])
         screenshot_path = run_dir / "browser_view.png"
         screenshot_path.write_bytes(raw)
 
         repair_path = run_dir / "repair_output.png"
-        workflow_path = ROOT / "FLUX.2+Klein+4B (1).json"
+        workflow_path = ROOT / "高斯泼溅修复工作流.json"
 
         client = ComfyUIClient(server="127.0.0.1:8188")
         client.run_flux2_klein_workflow(
             workflow_path=workflow_path,
-            input_image_path=screenshot_path,
+            input_image1_path=photo_path,
+            input_image2_path=screenshot_path,
             output_path=repair_path,
             prompt=payload.get("prompt"),
             seed=payload.get("seed"),
@@ -429,14 +450,14 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
             status["ply_url"] = f"/api/file?path={quote(str(ply_path))}"
 
         # When a new PLY is generated, update the manifest so future uploads
-        # of the same photo can skip SHARP.
+        # of the same photo can skip SHARP.  Derive the key from the *PLY*
+        # filename (not the staging image) because _ply_base_name's regex
+        # requires a .ply suffix to strip the _{8hex} hash.
         if status.get("state") == "done" and ply_path and not status.get("_cached"):
-            image_path_str = status.get("image_path", "")
-            if image_path_str:
-                base_name = _ply_base_name(Path(image_path_str).name)
-                manifest = _load_manifest()
-                manifest[base_name] = str(Path(ply_path).relative_to(ROOT))
-                _save_manifest(manifest)
+            base_name = _ply_base_name(Path(ply_path).name)
+            manifest = _load_manifest()
+            manifest[base_name] = str(Path(ply_path).relative_to(ROOT))
+            _save_manifest(manifest)
 
         status["sharp_available"] = SHARP_RUNNER.sharp_available()
         self._send_json(status)
