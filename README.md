@@ -184,3 +184,9 @@ tests/
 5. Add batch camera generation and a small evaluation set.
 
 Repair backend notes live in [docs/repair-backends.md](docs/repair-backends.md).
+
+## UI refactor v4 notes
+
+- The gallery is now persisted on the backend in `web_uploads/gallery/gallery.json`; uploaded originals are stored under `web_uploads/gallery/`, so the gallery can be restored after refresh/restart.
+- Gallery items keep original photo, generated PLY, latest raw 3DGS screenshot, and latest reconstruction result.
+- Reconstruction screenshots sent to ComfyUI are captured from the raw GaussianSplats3D render target before UI feathering/edge fill is applied. The user preview can stay visually softened, while ComfyUI still receives the black-hole/sparse 3DGS image that matches the LoRA training domain.

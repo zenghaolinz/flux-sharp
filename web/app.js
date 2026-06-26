@@ -5,7 +5,7 @@
 //   2. SHARP generates PLY from photo
 //   3. PLY loaded in GaussianSplats3D viewer (user adjusts camera)
 //   4. Screenshot current view → send to ComfyUI for repair
-//   5. Compare (screenshot vs repair) / Export repair result
+//   5. Compare (original photo vs repair) / Export repair result
 
 import * as THREE from "three";
 import { Viewer, SceneFormat } from "/web/vendor/gaussian-splats-3d.module.js";
@@ -34,18 +34,26 @@ function buildRepairPrompt(camMove) {
 const state = {
   photoWidth: 0,        // original photo width (px)
   photoHeight: 0,       // original photo height (px)
-  photoDataUrl: null,   // uploaded photo data URL
+  photoDataUrl: null,   // uploaded photo data URL, loaded lazily for ComfyUI payloads
+  photoUrl: null,       // persisted photo URL served by backend gallery
+  photoPath: null,      // persisted photo path relative to workspace
   photoName: null,      // original filename
   plyPath: null,        // generated PLY path from SHARP
   plyUrl: null,         // PLY URL for loading into viewer
   viewer: null,         // GaussianSplats3D Viewer instance
   disposePromise: null,  // pending viewer disposal promise
-  screenshotUrl: null,  // canvas screenshot URL (from ComfyUI response)
+  screenshotUrl: null,  // latest raw 3D canvas screenshot URL returned by backend
+  screenshotPath: null, // latest raw 3D screenshot path; persisted for gallery
   repairUrl: null,      // repair result URL
-  comparing: false,     // true = showing screenshot, false = showing repair
-  inRepairView: false,  // true = repair result is showing, preview image overlays canvas
+  repairPath: null,     // repair result path; persisted for gallery
+  comparing: false,     // true = showing original photo, false = showing repair
+  inRepairView: false,  // true = repair result/original comparison image overlays canvas
+  galleryItems: [],     // uploaded photos persisted on backend and restored on reload
+  currentItemId: null,  // selected gallery item id
   initialCameraPos: null,   // THREE.Vector3 — camera position at initial view
   initialCameraQuat: null,  // THREE.Quaternion — camera orientation at initial view
+  generationToken: 0,      // increments to invalidate stale async generate jobs
+  repairToken: 0,          // increments to invalidate stale async repair jobs
 };
 
 // ---------------------------------------------------------------------------
@@ -74,12 +82,6 @@ function showError(msg) {
   el._timer = setTimeout(() => el.classList.remove("visible"), 5000);
 }
 
-function setBusy(show, text) {
-  const overlay = $("busyOverlay");
-  if (text) $("busyText").textContent = text;
-  overlay.classList.toggle("visible", show);
-}
-
 function showModeBadge(text) {
   const badge = $("modeBadge");
   badge.textContent = text;
@@ -94,6 +96,145 @@ function showViewHint(show) {
   $("viewHint").classList.toggle("visible", show);
 }
 
+function setDockActive(section) {
+  $("uploadAction")?.classList.toggle("active", section === "upload");
+  $("galleryBtn")?.classList.toggle("active", section === "gallery");
+}
+
+function setFrameEffect(effect, enabled) {
+  const frame = $("frame");
+  if (!frame) return;
+  if (effect === "generate") {
+    frame.classList.toggle("is-generating", enabled);
+  }
+  if (effect === "reconstruct") {
+    frame.classList.toggle("is-reconstructing", enabled);
+  }
+}
+
+function setActionText(buttonId, text) {
+  const textEl = $(buttonId)?.querySelector(".action-text");
+  if (textEl) textEl.textContent = text;
+}
+
+function resetFrameEffects() {
+  setFrameEffect("generate", false);
+  setFrameEffect("reconstruct", false);
+}
+
+function assertFresh(tokenName, token) {
+  if (state[tokenName] !== token) {
+    throw new Error("__STALE_ASYNC_RESULT__");
+  }
+}
+
+async function urlToDataUrl(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`读取图片失败: HTTP ${res.status}`);
+  const blob = await res.blob();
+  return await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+
+function photoSrc(item = getCurrentItem()) {
+  if (!item) return state.photoDataUrl || state.photoUrl || "";
+  return item.photoDataUrl || item.photoUrl || "";
+}
+
+async function ensurePhotoDataUrl(item = getCurrentItem()) {
+  if (!item) {
+    if (state.photoDataUrl) return state.photoDataUrl;
+    if (state.photoUrl) {
+      state.photoDataUrl = await urlToDataUrl(state.photoUrl);
+      return state.photoDataUrl;
+    }
+    throw new Error("原图未加载");
+  }
+  if (item.photoDataUrl) return item.photoDataUrl;
+  if (!item.photoUrl) throw new Error("图库原图文件不存在");
+  item.photoDataUrl = await urlToDataUrl(item.photoUrl);
+  if (item.id === state.currentItemId) state.photoDataUrl = item.photoDataUrl;
+  return item.photoDataUrl;
+}
+
+function mergePersistedItem(localItem, persisted) {
+  if (!persisted) return localItem;
+  const mapped = {
+    id: persisted.id,
+    photoName: persisted.photo_name ?? localItem.photoName,
+    photoWidth: persisted.photo_width ?? localItem.photoWidth,
+    photoHeight: persisted.photo_height ?? localItem.photoHeight,
+    photoPath: persisted.photo_path ?? localItem.photoPath ?? null,
+    photoUrl: persisted.photo_url ?? localItem.photoUrl ?? null,
+    photoDataUrl: localItem.photoDataUrl ?? null,
+    plyPath: localItem.plyPath ?? null,
+    plyUrl: localItem.plyUrl ?? null,
+    screenshotPath: localItem.screenshotPath ?? null,
+    screenshotUrl: localItem.screenshotUrl ?? null,
+    repairPath: localItem.repairPath ?? null,
+    repairUrl: localItem.repairUrl ?? null,
+    createdAt: persisted.created_at ?? localItem.createdAt ?? Date.now() / 1000,
+    updatedAt: persisted.updated_at ?? localItem.updatedAt ?? Date.now() / 1000,
+  };
+  return mapped;
+}
+
+async function persistItem(item = getCurrentItem(), { includePhoto = false } = {}) {
+  if (!item) return null;
+  const payload = {
+    id: item.id,
+    photoName: item.photoName,
+    photoWidth: item.photoWidth,
+    photoHeight: item.photoHeight,
+  };
+  if (includePhoto && item.photoDataUrl && !item.photoPath) {
+    payload.photoDataUrl = item.photoDataUrl;
+  }
+  const data = await api("/api/gallery/upsert", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  const merged = mergePersistedItem(item, data.item);
+  Object.assign(item, merged);
+  if (item.id === state.currentItemId) applyItemToState(item, { keepView: true });
+  return item;
+}
+
+async function loadPersistentGallery() {
+  const data = await api("/api/gallery");
+  state.galleryItems = (data.items || []).map((it) => mergePersistedItem({}, it));
+  if (state.galleryItems.length && !state.currentItemId) {
+    state.currentItemId = state.galleryItems[0].id;
+    applyPhotoToFrame(state.galleryItems[0]);
+    setDockActive("gallery");
+  }
+  renderGallery();
+}
+
+function applyItemToState(item, { keepView = false } = {}) {
+  state.photoWidth = item.photoWidth;
+  state.photoHeight = item.photoHeight;
+  state.photoDataUrl = item.photoDataUrl || null;
+  state.photoUrl = item.photoUrl || null;
+  state.photoPath = item.photoPath || null;
+  state.photoName = item.photoName;
+  state.plyPath = item.plyPath || null;
+  state.plyUrl = item.plyUrl || null;
+  state.screenshotPath = item.screenshotPath || null;
+  state.screenshotUrl = item.screenshotUrl || null;
+  state.repairPath = item.repairPath || null;
+  state.repairUrl = item.repairUrl || null;
+  if (!keepView) {
+    state.comparing = false;
+    state.inRepairView = false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Frame: constrains 3D canvas & preview image to uploaded photo aspect ratio.
 // Acts like a “window” — splat rendering is clipped, no overflow on rotate.
@@ -106,28 +247,200 @@ function updateFrameSize() {
   if (!pw || !ph) return;
 
   const photoRatio = state.photoWidth / state.photoHeight;
-  const screenRatio = pw / ph;
+
+  // Leave room for the top bar and bottom glass controls.
+  const maxW = Math.min(pw * 0.72, 1120);
+  const maxH = Math.min(ph * 0.66, ph - 220);
 
   let frameW, frameH;
-  if (photoRatio > screenRatio) {
-    // Photo is wider — fit to width.
-    frameW = pw;
-    frameH = pw / photoRatio;
+  if (photoRatio > maxW / maxH) {
+    frameW = maxW;
+    frameH = maxW / photoRatio;
   } else {
-    // Photo is taller — fit to height.
-    frameH = ph;
-    frameW = ph * photoRatio;
+    frameH = maxH;
+    frameW = maxH * photoRatio;
   }
 
   const frame = $("frame");
-  frame.style.width = frameW + "px";
-  frame.style.height = frameH + "px";
+  const appliedFrameW = Math.max(280, frameW);
+  const appliedFrameH = Math.max(180, frameH);
+  frame.style.width = appliedFrameW + "px";
+  frame.style.height = appliedFrameH + "px";
 
   // Update camera aspect ratio so 3D content isn't stretched.
   if (state.viewer && state.viewer.camera) {
-    state.viewer.camera.aspect = frameW / frameH;
+    state.viewer.camera.aspect = appliedFrameW / appliedFrameH;
     state.viewer.camera.updateProjectionMatrix();
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// Gallery state: each uploaded photo becomes a selectable work item.
+// Items are kept in memory for the current browser session.
+// ---------------------------------------------------------------------------
+function getCurrentItem() {
+  return state.galleryItems.find((item) => item.id === state.currentItemId) || null;
+}
+
+function saveCurrentItem() {
+  const item = getCurrentItem();
+  if (!item) return;
+  item.photoWidth = state.photoWidth;
+  item.photoHeight = state.photoHeight;
+  item.photoDataUrl = state.photoDataUrl;
+  item.photoUrl = state.photoUrl;
+  item.photoPath = state.photoPath;
+  item.photoName = state.photoName;
+  item.plyPath = state.plyPath;
+  item.plyUrl = state.plyUrl;
+  item.screenshotUrl = state.screenshotUrl;
+  item.screenshotPath = state.screenshotPath;
+  item.repairUrl = state.repairUrl;
+  item.repairPath = state.repairPath;
+}
+
+function itemStage(item) {
+  return "原图";
+}
+
+function renderGallery() {
+  const grid = $("galleryGrid");
+  if (!grid) return;
+
+  if (!state.galleryItems.length) {
+    grid.innerHTML = `<div class="gallery-empty">还没有上传照片</div>`;
+    return;
+  }
+
+  grid.innerHTML = state.galleryItems.map((item) => `
+    <button class="gallery-card ${item.id === state.currentItemId ? "active" : ""}" type="button" data-id="${item.id}">
+      <img src="${photoSrc(item)}" alt="${item.photoName || "photo"}" />
+      <span class="gallery-meta">
+        <span class="gallery-name">${item.photoName || "未命名照片"}</span>
+        <span class="gallery-state">${itemStage(item)}</span>
+      </span>
+    </button>
+  `).join("");
+
+  grid.querySelectorAll(".gallery-card").forEach((card) => {
+    card.addEventListener("click", () => {
+      selectGalleryItem(card.dataset.id).catch((err) => showError(err.message || String(err)));
+      $("galleryPanel")?.classList.add("hidden");
+    });
+  });
+}
+
+function toggleGalleryPanel(force) {
+  const panel = $("galleryPanel");
+  if (!panel) return;
+  renderGallery();
+  const shouldShow = typeof force === "boolean" ? force : panel.classList.contains("hidden");
+  panel.classList.toggle("hidden", !shouldShow);
+  setDockActive("gallery");
+}
+
+async function persistCurrentItem() {
+  const item = getCurrentItem();
+  if (!item?.id) return;
+  const payload = {
+    id: item.id,
+    photoName: item.photoName,
+    photoWidth: item.photoWidth,
+    photoHeight: item.photoHeight,
+    photoPath: item.photoPath,
+  };
+  const data = await api('/api/gallery/update', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+  const normalized = mergePersistedItem(item, data.item);
+  const idx = state.galleryItems.findIndex((it) => it.id === normalized.id);
+  if (idx >= 0) state.galleryItems[idx] = normalized;
+  if (state.currentItemId === normalized.id) {
+    applyPhotoToFrame(normalized);
+  }
+  renderGallery();
+}
+
+function applyPhotoToFrame(item) {
+  applyItemToState(item);
+
+  const src = photoSrc(item);
+  const frame = $("frame");
+  frame.classList.add("active");
+  frame.style.backgroundImage = src ? `url("${src}")` : "none";
+  updateFrameSize();
+
+  $("uploadPrompt").classList.add("hidden");
+  $("canvasContainer").classList.remove("active");
+  const img = $("previewImg");
+  img.src = item.repairUrl ? `${item.repairUrl}&t=${Date.now()}` : src;
+  img.classList.add("visible");
+
+  $("postGroup").classList.toggle("hidden", !item.repairUrl);
+  $("compareBtn").classList.remove("active");
+  $("restoreBtn").textContent = "恢复3D";
+  showModeBadge(item.repairUrl ? "重构结果" : "");
+  showViewHint(false);
+
+  if (item.repairUrl) {
+    $("generateBtn").classList.add("hidden");
+    $("repairBtn").classList.remove("hidden");
+    $("repairBtn").disabled = false;
+    setActionText("repairBtn", "重构");
+    state.inRepairView = true;
+  } else if (item.plyUrl) {
+    $("generateBtn").classList.add("hidden");
+    $("repairBtn").classList.remove("hidden");
+    $("repairBtn").disabled = true;
+    setActionText("repairBtn", "加载3D…");
+  } else {
+    $("repairBtn").classList.add("hidden");
+    $("repairBtn").disabled = false;
+    setActionText("repairBtn", "重构");
+    $("generateBtn").classList.remove("hidden");
+    $("generateBtn").disabled = false;
+    setActionText("generateBtn", "生成");
+  }
+}
+
+async function selectGalleryItem(id) {
+  const item = state.galleryItems.find((it) => it.id === id);
+  if (!item) return;
+
+  saveCurrentItem();
+  state.currentItemId = id;
+  state.generationToken += 1;
+  state.repairToken += 1;
+  resetFrameEffects();
+  setDockActive("gallery");
+  disposeViewer();
+
+  applyPhotoToFrame(item);
+  renderGallery();
+
+  // If this photo already has a generated PLY but no repair result, restore its
+  // 3D preview immediately so the user can continue rotating/reconstructing.
+  if (item.plyUrl && !item.repairUrl) {
+    try {
+      await loadSplatPreview(item.plyUrl);
+      if (state.currentItemId !== id) return;
+      $("repairBtn").disabled = false;
+      setActionText("repairBtn", "重构");
+      showViewHint(true);
+    } catch (err) {
+      $("repairBtn").disabled = false;
+      setActionText("repairBtn", "重构");
+      showError("图库 3D 预览加载失败: " + (err.message || String(err)));
+    }
+  }
+}
+
+async function ensureViewerLoaded() {
+  if (state.viewer) return;
+  if (!state.plyUrl) throw new Error("这张照片还没有生成 3D，请先点击生成");
+  await loadSplatPreview(state.plyUrl);
 }
 
 // ---------------------------------------------------------------------------
@@ -135,48 +448,61 @@ function updateFrameSize() {
 // ---------------------------------------------------------------------------
 function onPhotoSelected(file) {
   if (!file) return;
-  state.photoName = file.name;
-  state.plyPath = null;
-  state.plyUrl = null;
-  state.screenshotUrl = null;
-  state.repairUrl = null;
-  state.comparing = false;
-  state.inRepairView = false;
+
+  saveCurrentItem();
+  const uploadToken = ++state.generationToken;
+  state.repairToken += 1;
+  resetFrameEffects();
+  setDockActive("upload");
 
   // Dispose previous viewer if any (fire-and-forget; loadSplatPreview awaits it).
   disposeViewer();
-  // Deactivate 3D canvas container (show photo instead).
   $("canvasContainer").classList.remove("active");
 
   const reader = new FileReader();
   reader.onload = () => {
-    state.photoDataUrl = reader.result;
-
-    // Save original photo dimensions for frame aspect ratio.
+    const dataUrl = reader.result;
     const tmpImg = new Image();
-    tmpImg.onload = () => {
-      state.photoWidth = tmpImg.naturalWidth;
-      state.photoHeight = tmpImg.naturalHeight;
-      updateFrameSize();
+    tmpImg.onload = async () => {
+      if (state.generationToken !== uploadToken) return;
+
+      const item = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        photoName: file.name,
+        photoDataUrl: dataUrl,
+        photoUrl: null,
+        photoPath: null,
+        photoWidth: tmpImg.naturalWidth,
+        photoHeight: tmpImg.naturalHeight,
+        plyPath: null,
+        plyUrl: null,
+        screenshotUrl: null,
+        screenshotPath: null,
+        repairUrl: null,
+        repairPath: null,
+      };
+      state.galleryItems.unshift(item);
+      state.currentItemId = item.id;
+
+      applyPhotoToFrame(item);
+
+      // Upload completion auto-enters Gallery state: photo is now the selected
+      // gallery item and can be generated/reconstructed from here.
+      setDockActive("gallery");
+      $("generateBtn").classList.remove("hidden");
+      $("generateBtn").disabled = false;
+      setActionText("generateBtn", "生成");
+      $("postGroup").classList.add("hidden");
+      renderGallery();
+
+      try {
+        await persistItem(item, { includePhoto: true });
+        renderGallery();
+      } catch (err) {
+        showError("图库持久化保存失败: " + (err.message || String(err)));
+      }
     };
-    tmpImg.src = reader.result;
-
-    // Show frame + uploaded photo.
-    $("frame").classList.add("active");
-    const img = $("previewImg");
-    img.src = reader.result;
-    img.classList.add("visible");
-
-    // Hide upload prompt, show generate button.
-    $("uploadPrompt").classList.add("hidden");
-    $("generateBtn").classList.remove("hidden");
-    $("generateBtn").disabled = false;
-
-    // Hide post-generate buttons and repair button.
-    $("postGroup").classList.add("hidden");
-    $("repairBtn").classList.add("hidden");
-    showModeBadge("");
-    showViewHint(false);
+    tmpImg.src = dataUrl;
   };
   reader.readAsDataURL(file);
 }
@@ -185,49 +511,65 @@ function onPhotoSelected(file) {
 // Generate: SHARP predict (photo → PLY) → load 3D preview
 // ---------------------------------------------------------------------------
 async function generate() {
-  if (!state.photoDataUrl) {
+  const token = ++state.generationToken;
+  if (!state.photoDataUrl && !state.photoUrl) {
     showError("请先上传一张照片");
     return;
   }
 
   $("generateBtn").disabled = true;
+  setActionText("generateBtn", "生成中…");
+  setFrameEffect("generate", true);
 
   try {
     // ── Stage 1: SHARP — photo → 3DGS .ply ──
-    setBusy(true, "正在生成 3D 模型…");
     const sharpData = await api("/api/sharp/generate", {
       method: "POST",
       body: JSON.stringify({
-        imageData: state.photoDataUrl,
+        imageData: await ensurePhotoDataUrl(),
         imageName: state.photoName,
       }),
     });
+    assertFresh("generationToken", token);
 
     // Poll SHARP status until done.
-    const plyPath = await pollSharpDone(sharpData.job_id);
+    const plyPath = await pollSharpDone(sharpData.job_id, {
+      timeoutMs: 15 * 60 * 1000,
+      isActive: () => state.generationToken === token,
+    });
+    assertFresh("generationToken", token);
     state.plyPath = plyPath;
 
     // Build PLY URL (use vertex-only endpoint for GaussianSplats3D compat).
     const plyUrl = `/api/ply-vertex-only?path=${encodeURIComponent(plyPath)}`;
     state.plyUrl = plyUrl;
+    saveCurrentItem();
+    try { await persistItem(); } catch (err) { console.warn("[gallery] persist after generate failed", err); }
+    renderGallery();
 
     // ── Stage 2: Load PLY into 3D viewer ──
-    // Hide our busy overlay — GaussianSplats3D shows its own loading spinner
-    // inside the canvas container, which gives better progress feedback.
-    setBusy(false);
     try {
       await loadSplatPreview(plyUrl);
+      assertFresh("generationToken", token);
     } catch (loadErr) {
       console.error("[generate] 3D preview load failed:", loadErr);
       throw new Error("3D 预览加载失败: " + (loadErr.message || String(loadErr)));
     }
 
     // Transition to 3D preview mode.
+    setFrameEffect("generate", false);
     $("generateBtn").classList.add("hidden");
     $("repairBtn").classList.remove("hidden");
+    $("repairBtn").disabled = false;
+    setActionText("repairBtn", "重构");
     showViewHint(true);
+    saveCurrentItem();
+    try { await persistItem(); } catch (err) { console.warn("[gallery] persist after 3D load failed", err); }
+    renderGallery();
   } catch (err) {
-    setBusy(false);
+    if (err.message === "__STALE_ASYNC_RESULT__") return;
+    setFrameEffect("generate", false);
+    setActionText("generateBtn", "生成");
     showError(err.message || String(err));
     $("generateBtn").disabled = false;
   }
@@ -260,14 +602,17 @@ async function loadSplatPreview(plyUrl) {
     // SharedArrayBuffer requires Cross-Origin-Isolation headers which our
     // simple HTTP server doesn't set. Disable to avoid DataCloneError.
     sharedMemoryForWorkers: false,
+    // Disable the built-in "Processing splats..." loading indicator.
+    showLoadingUI: false,
   });
 
   state.viewer = viewer;
 
-  // Activate canvas container BEFORE loading so GaussianSplats3D's
-  // built-in loading spinner and progress bar are visible to the user.
+  // Activate canvas container for 3D rendering.
   container.classList.add("active");
   $("previewImg").classList.remove("visible");
+  // Remove background photo so it doesn't show behind the 3D canvas.
+  $("frame").style.backgroundImage = "none";
 
   // Load the PLY file.
   // NOTE: Must pass format explicitly because the URL (/api/ply-vertex-only?path=...)
@@ -443,6 +788,8 @@ function setupSplatPostProcessing(viewer) {
     format: THREE.RGBAFormat,
     type: THREE.UnsignedByteType,
   });
+  viewer.__fluxSharpRawRenderTarget = splatRT;
+  viewer.__fluxSharpOriginalRender = viewer.render.bind(viewer);
 
   // ── Fullscreen quad + edge-feathering shader ──
   const postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -528,6 +875,49 @@ function setupSplatPostProcessing(viewer) {
 
   // ── Patch viewer.render() ──
   const originalRender = viewer.render.bind(viewer);
+
+  // Provide a RAW 3DGS screenshot path for ComfyUI. This bypasses the
+  // feathered display pass and captures the original splat render with the
+  // natural black holes expected by the downstream LoRA.
+  viewer.__captureRawScreenshot = async function () {
+    const size = new THREE.Vector2();
+    renderer.getDrawingBufferSize(size);
+    const rawRT = new THREE.WebGLRenderTarget(size.x, size.y, {
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      format: THREE.RGBAFormat,
+      type: THREE.UnsignedByteType,
+    });
+
+    const prevTarget = renderer.getRenderTarget();
+    const prevAutoClear = renderer.autoClear;
+    const pixels = new Uint8Array(size.x * size.y * 4);
+
+    try {
+      renderer.setRenderTarget(rawRT);
+      renderer.autoClear = true;
+      originalRender();
+      renderer.readRenderTargetPixels(rawRT, 0, 0, size.x, size.y, pixels);
+    } finally {
+      renderer.setRenderTarget(prevTarget);
+      renderer.autoClear = prevAutoClear;
+    }
+
+    const out = document.createElement('canvas');
+    out.width = size.x;
+    out.height = size.y;
+    const ctx = out.getContext('2d');
+    const imageData = ctx.createImageData(size.x, size.y);
+    const rowBytes = size.x * 4;
+    for (let y = 0; y < size.y; y++) {
+      const srcStart = (size.y - 1 - y) * rowBytes;
+      const dstStart = y * rowBytes;
+      imageData.data.set(pixels.subarray(srcStart, srcStart + rowBytes), dstStart);
+    }
+    ctx.putImageData(imageData, 0, 0);
+    rawRT.dispose();
+    return out.toDataURL('image/png');
+  };
   viewer.render = function () {
     const savedAutoClear = renderer.autoClear;
 
@@ -562,29 +952,70 @@ function disposeViewer() {
 }
 
 // ---------------------------------------------------------------------------
-// Screenshot: capture current 3D view as data URL
-// Captures at original photo resolution for consistent size with input.
+// Screenshot: capture RAW current 3DGS view as data URL.
+// IMPORTANT: this intentionally captures the un-feathered GaussianSplats3D
+// render with black holes/sparse areas. The preview UI may show a feathered
+// fill for users, but ComfyUI + LoRA reconstruction should receive the raw 3DGS
+// training-domain input, otherwise repair quality can degrade.
 // ---------------------------------------------------------------------------
-function captureScreenshot() {
+function captureRawSplatScreenshot() {
   const viewer = state.viewer;
   if (!viewer || !viewer.renderer) {
     throw new Error("3D 预览未就绪");
   }
 
   return new Promise((resolve, reject) => {
-    // Force a render so the canvas has the latest frame, then capture.
     requestAnimationFrame(() => {
       try {
-        const canvas = viewer.renderer.domElement;
+        const renderer = viewer.renderer;
+        const rawRT = viewer.__fluxSharpRawRenderTarget;
 
-        // Capture at canvas resolution — the canvas is sized to match
-        // the frame, which already has the photo's aspect ratio.
-        const offscreenCanvas = document.createElement('canvas');
+        if (rawRT) {
+          const width = rawRT.width;
+          const height = rawRT.height;
+
+          // Make sure rawRT contains the newest camera frame. Calling the saved
+          // original renderer while a render target is bound avoids the UI
+          // feathering post-process entirely.
+          const previousTarget = renderer.getRenderTarget();
+          const savedAutoClear = renderer.autoClear;
+          renderer.setRenderTarget(rawRT);
+          renderer.autoClear = true;
+          if (viewer.__fluxSharpOriginalRender) {
+            viewer.__fluxSharpOriginalRender();
+          }
+
+          const pixels = new Uint8Array(width * height * 4);
+          renderer.readRenderTargetPixels(rawRT, 0, 0, width, height, pixels);
+          renderer.setRenderTarget(previousTarget);
+          renderer.autoClear = savedAutoClear;
+
+          const offscreenCanvas = document.createElement("canvas");
+          offscreenCanvas.width = width;
+          offscreenCanvas.height = height;
+          const ctx = offscreenCanvas.getContext("2d");
+          const imageData = ctx.createImageData(width, height);
+
+          // WebGL readback is bottom-left origin; Canvas is top-left origin.
+          const rowBytes = width * 4;
+          for (let y = 0; y < height; y++) {
+            const srcStart = (height - 1 - y) * rowBytes;
+            const dstStart = y * rowBytes;
+            imageData.data.set(pixels.subarray(srcStart, srcStart + rowBytes), dstStart);
+          }
+          ctx.putImageData(imageData, 0, 0);
+          resolve(offscreenCanvas.toDataURL("image/png"));
+          return;
+        }
+
+        // Fallback for unexpected viewer internals: canvas capture. This is less
+        // ideal because it may include UI feathering, so normal code paths should
+        // always use the raw render target above.
+        const canvas = renderer.domElement;
+        const offscreenCanvas = document.createElement("canvas");
         offscreenCanvas.width = canvas.width;
         offscreenCanvas.height = canvas.height;
-        const ctx = offscreenCanvas.getContext('2d');
-        ctx.drawImage(canvas, 0, 0);
-
+        offscreenCanvas.getContext("2d").drawImage(canvas, 0, 0);
         resolve(offscreenCanvas.toDataURL("image/png"));
       } catch (err) {
         reject(err);
@@ -637,15 +1068,27 @@ function computeCameraMove() {
 // Repair: screenshot current view → send to ComfyUI
 // ---------------------------------------------------------------------------
 async function repair() {
-  if (!state.viewer) {
-    showError("3D 预览未就绪");
-    return;
-  }
-
+  const token = ++state.repairToken;
   try {
-    // Capture screenshot of current 3D view.
-    setBusy(true, "正在截取画面…");
-    const screenshotDataUrl = await captureScreenshot();
+    if (!state.viewer) {
+      await ensureViewerLoaded();
+      assertFresh("repairToken", token);
+    }
+
+    $("repairBtn").disabled = true;
+    setActionText("repairBtn", "重构中…");
+    setFrameEffect("reconstruct", true);
+
+    // Capture the current 3D view. If the repaired image is currently shown,
+    // reuse the last captured browser-view screenshot rather than grabbing a
+    // hidden canvas, which can be stale/blank in some browsers.
+    let screenshotDataUrl;
+    if (state.inRepairView && state.screenshotUrl) {
+      screenshotDataUrl = await urlToDataUrl(state.screenshotUrl);
+    } else {
+      screenshotDataUrl = await captureRawSplatScreenshot();
+    }
+    assertFresh("repairToken", token);
 
     // ── Compute camera movement delta ──
     const camMove = computeCameraMove();
@@ -654,12 +1097,11 @@ async function repair() {
     // Build prompt with camera movement coordinates.
     const prompt = buildRepairPrompt(camMove);
 
-    // Send original photo + screenshot to ComfyUI for repair.
-    setBusy(true, "正在修复图像…");
+    // Send original photo + screenshot to ComfyUI for reconstruction.
     const repairData = await api("/api/repair-screenshot", {
       method: "POST",
       body: JSON.stringify({
-        photo: state.photoDataUrl,
+        photo: await ensurePhotoDataUrl(),
         screenshot: screenshotDataUrl,
         prompt: prompt,
         steps: 4,
@@ -667,9 +1109,15 @@ async function repair() {
         ply_path: state.plyPath,
       }),
     });
+    assertFresh("repairToken", token);
 
     state.screenshotUrl = repairData.screenshot_url;
+    state.screenshotPath = repairData.screenshot_path || null;
     state.repairUrl = repairData.repair_url;
+    state.repairPath = repairData.repair_path || null;
+    saveCurrentItem();
+    try { await persistItem(); } catch (err) { console.warn("[gallery] persist after repair failed", err); }
+    renderGallery();
 
     // Hide 3D canvas — repair result is now showing.
     $("canvasContainer").classList.remove("active");
@@ -683,38 +1131,52 @@ async function repair() {
     // Reset restore button text.
     $("restoreBtn").textContent = "恢复3D";
 
-    // Switch buttons: hide repair, show compare + export.
-    $("repairBtn").classList.add("hidden");
+    // Keep the bottom CTA as 重构, and expose compare/export tools after result.
+    $("repairBtn").classList.remove("hidden");
+    $("repairBtn").disabled = false;
+    setActionText("repairBtn", "重构");
     showViewHint(false);
     $("postGroup").classList.remove("hidden");
     state.comparing = false;
-    showModeBadge("修复结果");
+    showModeBadge("重构结果");
     $("compareBtn").classList.remove("active");
+    saveCurrentItem();
+    try { await persistItem(); } catch (err) { console.warn("[gallery] persist after 3D load failed", err); }
+    renderGallery();
   } catch (err) {
-    showError(err.message || String(err));
+    if (err.message !== "__STALE_ASYNC_RESULT__") {
+      showError(err.message || String(err));
+    }
   } finally {
-    setBusy(false);
+    if (state.repairToken === token) {
+      setFrameEffect("reconstruct", false);
+      $("repairBtn").disabled = false;
+      setActionText("repairBtn", "重构");
+    }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Compare: toggle between screenshot (原图) and repair result (修复结果)
+// Compare: toggle between the uploaded original photo and the reconstruction result.
+// The project reconstructs the photo angle, so comparison must be 原图 ↔ 重构结果,
+// not 3D screenshot ↔ 重构结果.
 // ---------------------------------------------------------------------------
-function toggleCompare() {
-  if (!state.repairUrl) return;
+async function toggleCompare() {
+  if (!state.repairUrl || (!state.photoDataUrl && !state.photoUrl)) return;
 
   state.comparing = !state.comparing;
   const img = $("previewImg");
+  $("canvasContainer").classList.remove("active");
+  img.classList.add("visible");
 
   if (state.comparing) {
-    // Show the original uploaded photo.
-    img.src = state.photoDataUrl || "";
+    img.src = await ensurePhotoDataUrl();
+    state.inRepairView = true;
     showModeBadge("原图");
     $("compareBtn").classList.add("active");
   } else {
-    // Show repair result.
     img.src = `${state.repairUrl}&t=${Date.now()}`;
-    showModeBadge("修复结果");
+    showModeBadge("重构结果");
     $("compareBtn").classList.remove("active");
   }
 }
@@ -724,8 +1186,15 @@ function toggleCompare() {
 // when the user clicked "修复". The viewer is still in memory so the render
 // loop resumes automatically.
 // ---------------------------------------------------------------------------
-function restorePreview() {
-  if (!state.viewer) return;
+async function restorePreview() {
+  if (!state.viewer) {
+    try {
+      await ensureViewerLoaded();
+    } catch (err) {
+      showError(err.message || String(err));
+      return;
+    }
+  }
 
   // Show 3D canvas, hide preview image.
   $("canvasContainer").classList.add("active");
@@ -752,7 +1221,7 @@ function showRepairResult() {
   img.classList.add("visible");
   state.inRepairView = true;
   state.comparing = false;
-  showModeBadge("修复结果");
+  showModeBadge("重构结果");
   showViewHint(false);
   $("compareBtn").classList.remove("active");
 
@@ -785,11 +1254,28 @@ async function exportResult() {
 // ---------------------------------------------------------------------------
 // Poll SHARP status until done or failed
 // ---------------------------------------------------------------------------
-function pollSharpDone(jobId) {
+function pollSharpDone(jobId, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 15 * 60 * 1000;
+  const isActive = options.isActive ?? (() => true);
+  const startedAt = Date.now();
+
   return new Promise((resolve, reject) => {
     const tick = async () => {
+      if (!isActive()) {
+        reject(new Error("__STALE_ASYNC_RESULT__"));
+        return;
+      }
+      if (Date.now() - startedAt > timeoutMs) {
+        reject(new Error("SHARP 生成超时，请检查后端日志后重试"));
+        return;
+      }
+
       try {
         const status = await api(`/api/sharp/status?job_id=${encodeURIComponent(jobId)}`);
+        if (!isActive()) {
+          reject(new Error("__STALE_ASYNC_RESULT__"));
+          return;
+        }
         if (status.state === "done" && status.ply_path) {
           resolve(status.ply_path);
           return;
@@ -833,9 +1319,26 @@ async function refreshStatus() {
 // ---------------------------------------------------------------------------
 async function init() {
   // Wire up events.
-  $("photoInput").addEventListener("change", (e) => {
+  const handlePhotoInput = async (e) => {
     const file = e.target.files[0];
-    if (file) onPhotoSelected(file);
+    if (file) await onPhotoSelected(file);
+    e.target.value = "";
+  };
+  $("photoInput").addEventListener("change", handlePhotoInput);
+  $("dockPhotoInput").addEventListener("change", handlePhotoInput);
+
+  $("galleryBtn").addEventListener("click", () => {
+    if (!state.galleryItems.length) {
+      setDockActive("gallery");
+      showError("图库里还没有图片，请先上传");
+      renderGallery();
+      return;
+    }
+    toggleGalleryPanel();
+  });
+
+  $("galleryCloseBtn")?.addEventListener("click", () => {
+    $("galleryPanel")?.classList.add("hidden");
   });
 
   $("generateBtn").addEventListener("click", () => {
@@ -846,11 +1349,13 @@ async function init() {
     repair().catch((err) => showError(err.message));
   });
 
-  $("compareBtn").addEventListener("click", toggleCompare);
+  $("compareBtn").addEventListener("click", () => {
+    toggleCompare().catch((err) => showError(err.message || String(err)));
+  });
 
   $("restoreBtn").addEventListener("click", () => {
     if (state.inRepairView) {
-      restorePreview();
+      restorePreview().catch((err) => showError(err.message || String(err)));
     } else {
       showRepairResult();
     }
@@ -863,8 +1368,18 @@ async function init() {
   // Window resize: update frame dimensions.
   window.addEventListener("resize", updateFrameSize);
 
+  // Restore persistent gallery from backend so uploads survive refresh/restart.
+  try {
+    await loadPersistentGallery();
+  } catch (err) {
+    console.warn("[gallery] load persistent gallery failed", err);
+  }
+
   // Initial status check + polling.
   await refreshStatus();
+  if (state.galleryItems.length) {
+    await selectGalleryItem(state.galleryItems[0].id);
+  }
   setInterval(refreshStatus, 15000);
 }
 

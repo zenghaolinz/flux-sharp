@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 from uuid import uuid4
+from time import time
 
 from src.camera import CameraParams
 from src.comfyui_client import ComfyUIClient, ComfyUIError
@@ -30,7 +31,19 @@ INPUT_ROOT = ROOT / "inputs"
 SHARP_RUNNER = SharpRunner(output_root=OUTPUT_ROOT, inputs_root=INPUT_ROOT)
 COMFYUI_SERVER = "127.0.0.1:8188"
 MANIFEST_PATH = UPLOAD_ROOT / "manifest.json"
+GALLERY_DIR = UPLOAD_ROOT / "gallery"
+GALLERY_MANIFEST_PATH = GALLERY_DIR / "gallery.json"
 _PLY_HASH_RE = re.compile(r"^(.+?)_([0-9a-f]{8})\.ply$")
+
+
+def _gallery_find(item_id: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Find a gallery item by id using the unified Model 2 storage."""
+    items = _load_gallery()
+    for item in items:
+        if item.get("id") == item_id:
+            return items, item
+    return items, None
+
 
 
 def _load_manifest() -> dict[str, str]:
@@ -45,6 +58,72 @@ def _save_manifest(manifest: dict[str, str]) -> None:
     MANIFEST_PATH.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+
+
+def _load_gallery() -> list[dict[str, Any]]:
+    """Load the persistent gallery manifest.
+
+    The gallery stores stable file paths and URLs only; large image payloads stay
+    on disk under web_uploads/gallery so the UI can survive refresh/restart.
+    """
+    if not GALLERY_MANIFEST_PATH.exists():
+        return []
+    try:
+        data = json.loads(GALLERY_MANIFEST_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_gallery(items: list[dict[str, Any]]) -> None:
+    GALLERY_DIR.mkdir(parents=True, exist_ok=True)
+    GALLERY_MANIFEST_PATH.write_text(
+        json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _rel_to_root(path: str | Path | None) -> str | None:
+    if not path:
+        return None
+    try:
+        return str(_safe_workspace_path(path).relative_to(ROOT))
+    except Exception:
+        return str(path)
+
+
+def _file_url(path: str | Path | None) -> str | None:
+    if not path:
+        return None
+    try:
+        target = _safe_workspace_path(path)
+    except Exception:
+        target = ROOT / str(path)
+    return f"/api/file?path={quote(str(target))}"
+
+
+def _gallery_public_item(item: dict[str, Any]) -> dict[str, Any]:
+    photo_path = item.get("photo_path")
+    return {
+        "id": item.get("id"),
+        "photo_name": item.get("photo_name"),
+        "photo_width": item.get("photo_width"),
+        "photo_height": item.get("photo_height"),
+        "photo_path": photo_path,
+        "photo_url": _file_url(photo_path),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
+
+
+def _extract_file_path_from_api_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.path != "/api/file":
+        return None
+    query = parse_qs(parsed.query)
+    path = query.get("path", [None])[0]
+    return _rel_to_root(path) if path else None
 
 
 def _ply_base_name(ply_name: str) -> str:
@@ -227,6 +306,8 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     {"online": _comfyui_online(), "server": COMFYUI_SERVER}
                 )
+            elif parsed.path == "/api/gallery":
+                self._gallery_list()
             elif parsed.path == "/api/sharp/status":
                 self._sharp_status(parsed)
             elif parsed.path == "/api/sharp/ply":
@@ -250,10 +331,114 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
                 self._repair_screenshot(payload)
             elif parsed.path == "/api/sharp/generate":
                 self._sharp_generate(payload)
+            elif parsed.path == "/api/gallery/upsert":
+                self._gallery_upsert(payload)
+            elif parsed.path == "/api/gallery/import":
+                self._gallery_import(payload)
+            elif parsed.path == "/api/gallery/update":
+                self._gallery_update(payload)
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
         except Exception as exc:
             self._send_error(exc)
+
+    def _gallery_import(self, payload: dict[str, Any]) -> None:
+        image_data = payload.get("imageData")
+        if not image_data:
+            raise ValueError("Missing 'imageData' data URL in request body.")
+        image_name = payload.get("imageName") or "upload.png"
+        photo_width = int(payload.get("photoWidth") or 0)
+        photo_height = int(payload.get("photoHeight") or 0)
+
+        raw, mime_type = _decode_upload(image_data)
+        suffix = _extension_for_mime(mime_type, image_name)
+        item_id = uuid4().hex
+        safe_stem = re.sub(r"[^\w\-.]+", "_", Path(image_name).stem)[:60] or "photo"
+        photo_path = GALLERY_DIR / f"{item_id}_{safe_stem}{suffix}"
+        photo_path.parent.mkdir(parents=True, exist_ok=True)
+        photo_path.write_bytes(raw)
+
+        now = time()
+        item = {
+            "id": item_id,
+            "photo_name": image_name,
+            "photo_width": photo_width,
+            "photo_height": photo_height,
+            "photo_path": str(photo_path.relative_to(ROOT)),
+            "created_at": now,
+            "updated_at": now,
+        }
+        items = _load_gallery()
+        items.append(item)
+        _save_gallery(items)
+        self._send_json({"item": _gallery_public_item(item)})
+
+    def _gallery_update(self, payload: dict[str, Any]) -> None:
+        item_id = payload.get("id")
+        if not item_id:
+            raise ValueError("Missing 'id' in gallery update payload.")
+        items, item = _gallery_find(item_id)
+        if item is None:
+            raise ValueError(f"Unknown gallery item id: {item_id}")
+
+        if payload.get("photoName") is not None:
+            item["photo_name"] = payload.get("photoName")
+        if payload.get("photoWidth") is not None:
+            item["photo_width"] = payload.get("photoWidth")
+        if payload.get("photoHeight") is not None:
+            item["photo_height"] = payload.get("photoHeight")
+
+        path_map = {
+            "photoPath": "photo_path",
+        }
+        for src_key, dst_key in path_map.items():
+            if src_key in payload:
+                item[dst_key] = _rel_to_root(payload.get(src_key))
+
+        item["updated_at"] = time()
+        _save_gallery(items)
+        self._send_json({"item": _gallery_public_item(item)})
+
+
+    def _gallery_list(self) -> None:
+        items = _load_gallery()
+        items.sort(key=lambda it: it.get("updated_at") or it.get("created_at") or 0, reverse=True)
+        self._send_json({"items": [_gallery_public_item(it) for it in items]})
+
+    def _gallery_upsert(self, payload: dict[str, Any]) -> None:
+        items = _load_gallery()
+        item_id = payload.get("id") or uuid4().hex
+        now = time()
+        existing = next((it for it in items if it.get("id") == item_id), None)
+        if existing is None:
+            existing = {"id": item_id, "created_at": now}
+            items.append(existing)
+
+        existing["updated_at"] = now
+        if payload.get("photoName") is not None:
+            existing["photo_name"] = payload.get("photoName") or "未命名照片"
+        if payload.get("photoWidth") is not None:
+            existing["photo_width"] = payload.get("photoWidth")
+        if payload.get("photoHeight") is not None:
+            existing["photo_height"] = payload.get("photoHeight")
+
+        image_data = payload.get("photoDataUrl")
+        if image_data and not existing.get("photo_path"):
+            raw, mime_type = _decode_upload(image_data)
+            suffix = _extension_for_mime(mime_type, existing.get("photo_name") or "photo.png")
+            safe_stem = re.sub(r"[^\w\-.]+", "_", Path(existing.get("photo_name") or "photo").stem)[:60] or "photo"
+            photo_path = GALLERY_DIR / f"{item_id}_{safe_stem}{suffix}"
+            photo_path.parent.mkdir(parents=True, exist_ok=True)
+            photo_path.write_bytes(raw)
+            existing["photo_path"] = str(photo_path.relative_to(ROOT))
+
+        if payload.get("photoPath"):
+            existing["photo_path"] = _rel_to_root(payload.get("photoPath"))
+
+        # Newest first on disk for predictable gallery order.
+        items.sort(key=lambda it: it.get("updated_at") or it.get("created_at") or 0, reverse=True)
+        _save_gallery(items)
+        self._send_json({"item": _gallery_public_item(existing)})
 
     def _create_session(self, payload: dict[str, Any]) -> None:
         session_id = uuid4().hex
@@ -331,21 +516,31 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
         # workflow, and return the repaired image URL.
         if "screenshot" not in payload:
             raise ValueError("Missing 'screenshot' data URL in request body.")
-        if "photo" not in payload:
-            raise ValueError("Missing 'photo' data URL in request body.")
-
         session_id = payload.get("session_id") or uuid4().hex
         run_dir = OUTPUT_ROOT / f"browser_{session_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save original photo (image 1) and screenshot (image 2).
-        photo_raw, photo_mime = _decode_upload(payload["photo"])
-        photo_ext = _extension_for_mime(photo_mime, "photo.png")
-        photo_path = run_dir / f"photo{photo_ext}"
-        photo_path.write_bytes(photo_raw)
+        # Save original photo (image 1) and screenshot (image 2). The screenshot
+        # must be the RAW 3DGS view (with natural black holes), not the feathered
+        # display preview, because the downstream LoRA was trained on raw 3DGS views.
+        if payload.get("photo"):
+            photo_raw, photo_mime = _decode_upload(payload["photo"])
+            photo_ext = _extension_for_mime(photo_mime, "photo.png")
+            photo_path = run_dir / f"photo{photo_ext}"
+            photo_path.write_bytes(photo_raw)
+        else:
+            item_id = payload.get("item_id")
+            if not item_id:
+                raise ValueError("Missing 'photo' or 'item_id' in request body.")
+            _items, item = _gallery_find(item_id)
+            if item is None or not item.get("photo_path"):
+                raise ValueError(f"Unknown gallery item id: {item_id}")
+            stored_photo = ROOT / item["photo_path"]
+            photo_path = run_dir / stored_photo.name
+            photo_path.write_bytes(stored_photo.read_bytes())
 
         raw, _mime = _decode_upload(payload["screenshot"])
-        screenshot_path = run_dir / "browser_view.png"
+        screenshot_path = run_dir / "raw_3dgs_view.png"
         screenshot_path.write_bytes(raw)
 
         repair_path = run_dir / "repair_output.png"
@@ -378,9 +573,23 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
         # into a 3DGS .ply. Returns immediately with a job_id; the front-end
         # polls /api/sharp/status.
         image_data = payload.get("imageData")
-        if not image_data:
-            raise ValueError("Missing 'imageData' data URL in request body.")
+        item_id = payload.get("item_id")
         image_name = payload.get("imageName") or "upload.png"
+        raw = None
+        mime_type = None
+
+        if image_data:
+            raw, mime_type = _decode_upload(image_data)
+        elif item_id:
+            _items, item = _gallery_find(item_id)
+            if item is None or not item.get("photo_path"):
+                raise ValueError(f"Unknown gallery item id: {item_id}")
+            image_path_saved = ROOT / item["photo_path"]
+            raw = image_path_saved.read_bytes()
+            image_name = item.get("photo_name") or image_path_saved.name
+            mime_type = {".png":"image/png",".jpg":"image/jpeg",".jpeg":"image/jpeg",".webp":"image/webp"}.get(image_path_saved.suffix.lower(), "image/png")
+        else:
+            raise ValueError("Missing 'imageData' or 'item_id' in request body.")
 
         # ─ Cache hit: PLY already exists for this photo → skip SHARP. ──
         cached_ply = _find_cached_ply(image_name)
@@ -421,7 +630,6 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
                 "or put `sharp` on PATH."
             )
 
-        raw, mime_type = _decode_upload(image_data)
         suffix = _extension_for_mime(mime_type, image_name)
         job_staging = OUTPUT_ROOT / "sharp_staging"
         job_staging.mkdir(parents=True, exist_ok=True)
@@ -491,6 +699,8 @@ class FluxSharpHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(target.stat().st_size))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
         self.end_headers()
         self.wfile.write(target.read_bytes())
 
