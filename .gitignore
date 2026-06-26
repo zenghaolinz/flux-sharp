@@ -8,6 +8,11 @@ venv/
 # Server runtime logs
 web_server.err.log
 web_server.out.log
+server_test.err
+server_test.out
+
+# Windows redirect artifact (e.g. `> NUL` gone wrong)
+nul
 
 # Web UI session uploads (user reference images + camera json)
 web_uploads/*
